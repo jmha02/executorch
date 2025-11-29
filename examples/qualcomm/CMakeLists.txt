@@ -27,7 +27,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # some toolchains might contain their own packages, skip them here
-find_package(gflags REQUIRED NO_CMAKE_FIND_ROOT_PATH)
+# find_package(gflags REQUIRED NO_CMAKE_FIND_ROOT_PATH)
 find_package(absl REQUIRED NO_CMAKE_FIND_ROOT_PATH)
 
 # Find prebuilt libraries. executorch package should contain portable_ops_lib,
@@ -85,3 +85,6 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/qaihub_scripts/llama)
 
 # build qaihub_stable_diffusion_runner
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/qaihub_scripts/stable_diffusion)
+
+# build lora_training_runner for on-device training
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/lora_training_runner)
