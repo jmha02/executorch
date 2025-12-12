@@ -9,6 +9,7 @@
 #include <executorch/extension/module/module.h>
 #include <executorch/runtime/platform/runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -209,6 +210,7 @@ int main(int argc, char** argv) {
   for (int epoch = 0; epoch < epochs; ++epoch) {
     size_t steps = std::max<size_t>(1, num_samples);
     for (size_t step = 0; step < steps; ++step) {
+      auto t_begin = std::chrono::steady_clock::now();
       // ids/labels: from dataset if available
       if (!input_data.empty()) {
         size_t off = step % num_samples;
@@ -268,8 +270,12 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < lora_B.size(); ++i) {
         lora_B[i] -= lr * grad * noise[i];
       }
-      std::printf("[Epoch %d Step %zu/%zu] loss=%.6f grad=%.6f grad_noise_abs_sum=%.6f\n",
-                  epoch, step + 1, steps, loss, grad, grad_abs_sum);
+      auto t_end = std::chrono::steady_clock::now();
+      double step_ms = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_begin).count() / 1000.0;
+      double tokens = static_cast<double>(batch * seq_len);
+      double tok_per_s = step_ms > 0.0 ? tokens / (step_ms / 1000.0) : 0.0;
+      std::printf("[Epoch %d Step %zu/%zu] loss=%.6f grad=%.6f grad_noise_abs_sum=%.6f step_ms=%.3f tok/s=%.2f\n",
+                  epoch, step + 1, steps, loss, grad, grad_abs_sum, step_ms, tok_per_s);
     }
   }
 
