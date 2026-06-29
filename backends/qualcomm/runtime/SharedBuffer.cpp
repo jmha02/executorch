@@ -64,8 +64,10 @@ std::mutex SharedBuffer::init_mutex_;
 void* SharedBuffer::GetCustomMemBase(void* buf) {
   auto it = tensor_addr_to_custom_mem_.find(buf);
   if (it == tensor_addr_to_custom_mem_.end()) {
+    QnnExecuTorchAotDiagAdd(kAotDiagCustomMemAddrMiss, 1);
     return nullptr;
   }
+  QnnExecuTorchAotDiagAdd(kAotDiagCustomMemAddrHit, 1);
   return it->second;
 }
 
@@ -103,6 +105,8 @@ SharedBuffer::~SharedBuffer() {
 };
 
 void* SharedBuffer::AllocMem(size_t bytes, size_t alignment) {
+  QnnExecuTorchAotDiagAdd(kAotDiagRpcmemAlloc, 1);
+  QnnExecuTorchAotDiagAdd(kAotDiagRpcmemTotalBytes, bytes);
   if (!initialize_) {
     QNN_EXECUTORCH_LOG_ERROR("Shared memory not initialized.");
     return nullptr;
@@ -137,6 +141,7 @@ int32_t SharedBuffer::MemToFd(void* buf) {
 }
 
 void SharedBuffer::FreeMem(void* buf) {
+  QnnExecuTorchAotDiagAdd(kAotDiagRpcmemFree, 1);
   if (!initialize_) {
     QNN_EXECUTORCH_LOG_ERROR("Shared memory not initialized.");
   } else if (restore_map_.count(buf) == 0) {
@@ -186,6 +191,7 @@ Error SharedBuffer::Load() {
 }
 
 void SharedBuffer::AddCusomMemTensorAddr(void* tensor_addr, void* custom_mem) {
+  QnnExecuTorchAotDiagAdd(kAotDiagCustomMemAddrMap, 1);
   bool status =
       tensor_addr_to_custom_mem_.insert({tensor_addr, custom_mem}).second;
   if (!status) {

@@ -308,6 +308,21 @@ class Module {
         "forward", planned_memory, event_tracer, backend_options);
   }
 
+  /**
+   * Retrieves memory-planned buffer sizes for a method.
+   *
+   * This is primarily useful for runtimes that need to provide externally owned
+   * planned-memory arenas, e.g. device shared-buffer backed activation/output
+   * arenas.
+   */
+  ET_NODISCARD runtime::Result<std::vector<size_t>> planned_buffer_sizes(
+      const std::string& method_name);
+
+  ET_NODISCARD inline runtime::Result<std::vector<size_t>>
+  forward_planned_buffer_sizes() {
+    return planned_buffer_sizes("forward");
+  }
+
   ET_DEPRECATED ET_NODISCARD inline runtime::Error load_forward(
       torch::executor::EventTracer* event_tracer) {
     return load_forward(nullptr, event_tracer, nullptr);
@@ -559,6 +574,19 @@ class Module {
       size_t output_index = 0);
 
   /**
+   * Sets a tensor output to externally owned storage, including outputs that
+   * were allocated by the memory planner.
+   *
+   * This is intended for explicit output allocator integrations that need the
+   * method output tensor to point at device/shared-buffer backed memory.
+   */
+  ET_NODISCARD
+  runtime::Error set_output_external_storage(
+      const std::string& method_name,
+      runtime::EValue output_value,
+      size_t output_index = 0);
+
+  /**
    * Sets the output tensor for the "forward" method.
    *
    * @param[in] output_value The EValue containing the Tensor to set as the
@@ -574,6 +602,14 @@ class Module {
       runtime::EValue output_value,
       size_t output_index = 0) {
     return set_output("forward", std::move(output_value), output_index);
+  }
+
+  ET_NODISCARD
+  inline runtime::Error set_output_external_storage(
+      runtime::EValue output_value,
+      size_t output_index = 0) {
+    return set_output_external_storage(
+        "forward", std::move(output_value), output_index);
   }
 
   /**

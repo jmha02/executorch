@@ -25,7 +25,6 @@ from executorch.backends.qualcomm.utils.constants import (
 from .node_visitor import NodeVisitor, PER_CHANNEL_ENCODING, QNN_QUANT_TYPE_MAP
 from .node_visitor_manager import register_node_visitor
 from .qnn_constants import OpConvert, OpGather, QNN_OP_PACKAGE_NAME_QTI_AISW
-from .utils import get_parameter
 
 
 @register_node_visitor
@@ -44,12 +43,14 @@ class Embedding(NodeVisitor):
         is_pcq_embedding = QCOM_QUANT_ATTRS in weight_node.meta and weight_node.meta[
             QCOM_QUANT_ATTRS
         ][QCOM_ENCODING] in (PER_CHANNEL_ENCODING)
-        weight_tensor = get_parameter(weight_node, self.edge_program)
+        weight_tensor = self.get_tensor(weight_node, node)
         weight_tensor_wrapper = self.define_tensor(
             weight_node,
             node,
             weight_tensor,
-            PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_STATIC,
+            # Parameters remain STATIC through get_tensor_type(), while
+            # mutable PTD-backed parameters can become QNN graph inputs.
+            PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_NATIVE,
             nodes_to_wrappers,
         )
 

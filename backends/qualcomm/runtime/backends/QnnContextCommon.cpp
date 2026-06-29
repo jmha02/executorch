@@ -7,6 +7,7 @@
  */
 
 #include <executorch/backends/qualcomm/runtime/backends/QnnContextCommon.h>
+#include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
 #include <executorch/backends/qualcomm/runtime/backends/QnnDlcManager.h>
 
 namespace executorch {
@@ -46,6 +47,7 @@ Error QnnContext::Configure() {
     const QnnExecuTorchContextBinary& qnn_context_blob =
         cache_->GetQnnContextBlob();
 
+    QnnExecuTorchAotDiagAdd(kAotDiagQnnContextCreateFromBinary, 1);
     error = qnn_interface.qnn_context_create_from_binary(
         backend_->GetHandle(),
         device_->GetHandle(),
@@ -65,6 +67,7 @@ Error QnnContext::Configure() {
       cache_->GetCacheState() == QnnBackendCache::SERIALIZE ||
       cache_->GetCacheState() == QnnBackendCache::ONLINE_PREPARE ||
       cache_->GetCacheState() == QnnBackendCache::MULTI_GRAPH) {
+    QnnExecuTorchAotDiagAdd(kAotDiagQnnContextCreate, 1);
     error = qnn_interface.qnn_context_create(
         backend_->GetHandle(),
         device_->GetHandle(),

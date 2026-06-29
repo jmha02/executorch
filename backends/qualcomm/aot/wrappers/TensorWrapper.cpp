@@ -8,6 +8,8 @@
 
 #include <executorch/backends/qualcomm/aot/wrappers/TensorWrapper.h>
 
+#include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
+
 #include <c10/util/safe_numerics.h>
 #include <executorch/runtime/platform/assert.h>
 
@@ -120,6 +122,8 @@ TensorWrapper::TensorWrapper(
 
 Error TensorWrapper::FillDataBuffer(const void* data) {
   if (data != nullptr) {
+    QnnExecuTorchAotDiagAdd(kAotDiagQnnFillDataBuffer, 1);
+    QnnExecuTorchAotDiagAdd(kAotDiagQnnFillDataBufferBytes, bytes_);
     QNN_TENSOR_VER_PTR(tensor_)->memType = QNN_TENSORMEMTYPE_RAW;
 #ifdef __hexagon__
     // data's address is already aligned in idl skel implementation. e.g.
@@ -166,6 +170,7 @@ Error TensorWrapper::SetName(const std::string& name) {
 }
 
 Error TensorWrapper::SetMemHandle(Qnn_MemHandle_t mem_handle) {
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnSetMemHandle, 1);
   QNN_TENSOR_VER_PTR(tensor_)->memType = QNN_TENSORMEMTYPE_MEMHANDLE;
   QNN_TENSOR_VER_PTR(tensor_)->memHandle = mem_handle;
   return Error::Ok;

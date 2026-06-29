@@ -57,6 +57,12 @@ def _is_mutable_weight(node: torch.fx.Node, ep: ExportedProgram) -> bool:
         for spec in ep.graph_signature.output_specs
         if spec.kind == OutputKind.GRADIENT_TO_PARAMETER
     ]
+    if (
+        node.op == "placeholder"
+        and node.target in ep.graph_signature.inputs_to_parameters.keys()
+        and node.meta.get("external_mutable_weight", False)
+    ):
+        return True
     return (
         node.op == "placeholder"
         and node.target in ep.graph_signature.inputs_to_parameters.keys()

@@ -341,6 +341,7 @@ def to_edge_transform_and_lower_to_qnn(
     skip_mutable_buffer: Optional[bool] = False,
     generate_etrecord: Optional[bool] = False,
     convert_linear_to_conv2d: Optional[bool] = False,
+    mutable_parameter_names: Optional[Union[List[str], Dict[str, List[str]]]] = None,
 ) -> EdgeProgramManager:
     """
     Transforms and lowers a given PyTorch module to the QNN backend.
@@ -369,6 +370,9 @@ def to_edge_transform_and_lower_to_qnn(
             Whether to skip delegating the mutable buffer in QNN backend.
         convert_linear_to_conv2d (Optional[bool]):
             Whether to convert linear to conv2d in some cases to improve performance in HTP backend.
+        mutable_parameter_names (Optional[Union[List[str], Dict[str, List[str]]]]):
+            Parameter FQNs to keep as top-level mutable values while passing them
+            to QNN as runtime delegate inputs.
 
     Returns:
         EdgeProgramManager:
@@ -410,6 +414,9 @@ def to_edge_transform_and_lower_to_qnn(
     dynamic_shapes = ensure_graph_specific_dict(dynamic_shapes, graph_names)
     dep_table = ensure_graph_specific_dict(dep_table, graph_names)
     passes_job = ensure_graph_specific_dict(passes_job, graph_names)
+    mutable_parameter_names = ensure_graph_specific_dict(
+        mutable_parameter_names, graph_names
+    )
 
     # Prepare programs and partitioners
     aten_programs = {}
@@ -421,6 +428,7 @@ def to_edge_transform_and_lower_to_qnn(
                 skip_node_id_set=skip_node_id_set,
                 skip_node_op_set=skip_node_op_set,
                 skip_mutable_buffer=skip_mutable_buffer,
+                mutable_parameter_names=mutable_parameter_names[graph_name],
             )
         ]
         for graph_name in graph_names

@@ -16,7 +16,6 @@ from executorch.backends.qualcomm.utils.constants import QCOM_DATA
 from .node_visitor import NodeVisitor
 from .node_visitor_manager import register_node_visitor
 from .qnn_constants import OpLayerNorm, QNN_OP_PACKAGE_NAME_QTI_AISW
-from .utils import get_parameter
 
 
 @register_node_visitor
@@ -55,12 +54,14 @@ class LayerNormVisitor(NodeVisitor):
         axis_shape = [len(axis)]
 
         weight_node = self.get_node(node.args[2])
-        weight_tensor = get_parameter(weight_node, self.edge_program)
+        weight_tensor = self.get_tensor(weight_node, node)
         weight_tensor_wrapper = self.define_tensor(
             weight_node,
             node,
             weight_tensor,
-            PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_STATIC,
+            # Parameters remain STATIC through get_tensor_type(), while
+            # mutable PTD-backed parameters can become QNN graph inputs.
+            PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_NATIVE,
             nodes_to_wrappers,
         )
 
@@ -68,12 +69,12 @@ class LayerNormVisitor(NodeVisitor):
 
         bias_node = self.get_node(node.args[3])
         if bias_node is not None:
-            bias_tensor = get_parameter(bias_node, self.edge_program)
+            bias_tensor = self.get_tensor(bias_node, node)
             bias_tensor_wrapper = self.define_tensor(
                 bias_node,
                 node,
                 bias_tensor,
-                PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_STATIC,
+                PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_NATIVE,
                 nodes_to_wrappers,
             )
             layer_norm_input_tensors.append(bias_tensor_wrapper)

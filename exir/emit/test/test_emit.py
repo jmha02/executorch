@@ -2293,6 +2293,43 @@ class TestEmit(unittest.TestCase):
         self.assertEqual(external_map["net.linear.weight"], 0)
         self.assertEqual(external_map["net.linear.bias"], 1)
 
+    def test_forward_only_constant_tagged_mutable_tensors(self) -> None:
+        class Net(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(2, 2)
+
+            def forward(self, input, label):
+                pred = self.linear(input)
+                return nn.CrossEntropyLoss()(pred, label)
+
+        ep = export(
+            Net(), (torch.randn(1, 2), torch.ones(1, dtype=torch.int64)), strict=True
+        )
+        ep = to_edge(ep)
+        ep = ep.to_executorch(
+            config=ExecutorchBackendConfig(
+                external_mutable_weights=True,
+                external_mutable_weights_from_forward=True,
+            )
+        )
+
+        emitter_output = ep._emitter_output
+        self.assertEqual(len(emitter_output.program.constant_buffer), 1)
+        self.assertEqual(len(emitter_output.external_constant_buffer), 2)
+        external_map = emitter_output.external_constant_map[
+            "_default_external_constant"
+        ]
+        self.assertEqual(external_map["linear.weight"], 0)
+        self.assertEqual(external_map["linear.bias"], 1)
+
+        method_names = [
+            plan.name for plan in emitter_output.program.execution_plan
+        ]
+        self.assertIn("__et_training_parameters_index_forward", method_names)
+        self.assertIn("__et_training_fqn_forward", method_names)
+        self.assertNotIn("__et_training_gradients_index_forward", method_names)
+
     def test_emit_mutable_buffer_names(self) -> None:
         class Net(nn.Module):
             def __init__(self):

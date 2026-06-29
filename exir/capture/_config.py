@@ -6,7 +6,7 @@
 
 # pyre-unsafe
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -106,6 +106,17 @@ class ExecutorchBackendConfig:
     # If set to true, all trainable weights will be stored in a separate file,
     # external to the PTE file.
     external_mutable_weights: bool = False
+
+    # If set to true, parameter placeholders in a forward-only graph can be
+    # exposed as mutable TOKEN outputs even when the graph has no gradient
+    # outputs. This is intended for zeroth-order training runners that update
+    # PTD-backed parameters using forward loss evaluations only.
+    external_mutable_weights_from_forward: bool = False
+
+    # Optional allowlist of fully qualified parameter names to expose in the
+    # forward-only mutable-weight path. If omitted, all parameter placeholders
+    # are exposed when external_mutable_weights_from_forward is true.
+    external_mutable_weight_names: Optional[Sequence[str]] = None
 
     # If set to true, all mutable buffers will have their fully qualified names
     # serialized in the PTE file. Its value is ignored if mutable buffers are not

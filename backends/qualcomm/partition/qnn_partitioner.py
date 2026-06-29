@@ -6,7 +6,7 @@
 import copy
 import logging
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from executorch.backends.qualcomm.builders import node_visitor_manager
@@ -103,8 +103,15 @@ class QnnOperatorSupport(OperatorSupportBase):
             print(f"[QNN Partitioner Op Support]: {node.target.__name__} | Skipped")
             return False
 
+        visitor = self.node_visitors.get(node.target.__name__)
+        if visitor is None:
+            print(
+                f"[QNN Partitioner Op Support]: {node.target.__name__} | Skipped, no op visitor"
+            )
+            return False
+
         supported = False
-        op_wrapper = self.node_visitors[node.target.__name__].define_node(
+        op_wrapper = visitor.define_node(
             node, self.nodes_to_wrappers
         )
         if node.target in constant_operator:
@@ -138,6 +145,7 @@ class QnnPartitioner(Partitioner):
         skip_node_id_set: set = None,
         skip_node_op_set: set = None,
         skip_mutable_buffer: bool = False,
+        mutable_parameter_names: Optional[Sequence[str]] = None,
     ):
         """
         Args:
@@ -145,6 +153,9 @@ class QnnPartitioner(Partitioner):
             skip_node_id_set (set, optional): Set of node IDs to exclude from partitioning.
             skip_node_op_set (set, optional): Set of OpOverload to exclude from partitioning.
             skip_mutable_buffer (bool, optional): If True, mutable buffers are not delegated to QNN.
+            mutable_parameter_names (Sequence[str], optional): Parameter FQNs to keep
+                as top-level mutable values while passing them to the QNN delegate as
+                runtime inputs.
         """
         self.compiler_specs_snapshot = copy.deepcopy(compiler_specs)
         self.backend = flatbuffer_to_option(
@@ -158,6 +169,9 @@ class QnnPartitioner(Partitioner):
         self.skip_node_id_set = set() if skip_node_id_set is None else skip_node_id_set
         self.skip_node_op_set = set() if skip_node_op_set is None else skip_node_op_set
         self.skip_mutable_buffer = skip_mutable_buffer
+        self.mutable_parameter_names: Set[str] = (
+            set() if mutable_parameter_names is None else set(mutable_parameter_names)
+        )
 
     def generate_partitions(
         self, edge_program: torch.export.ExportedProgram
@@ -200,6 +214,26 @@ class QnnPartitioner(Partitioner):
                 # since they will all be removed in following stage
                 node.meta["delegation_tag"] = delegation_tag
 
+    def untag_mutable_parameters(
+        self, edge_program: torch.export.ExportedProgram
+    ) -> None:
+        if len(self.mutable_parameter_names) == 0:
+            return
+
+        inputs_to_parameters = edge_program.graph_signature.inputs_to_parameters
+        for node in edge_program.graph_module.graph.nodes:
+            if node.op != "placeholder" or node.name not in inputs_to_parameters:
+                continue
+            if inputs_to_parameters[node.name] not in self.mutable_parameter_names:
+                continue
+
+            # Leave the placeholder in the top-level program so later
+            # external_mutable_weights handling can keep it PTD-backed. The
+            # QNN submodule will still receive it as a delegate argument, but
+            # as a USER_INPUT instead of a QNN STATIC tensor.
+            node.meta.pop("delegation_tag", None)
+            node.meta["qnn_mutable_parameter_input"] = True
+
     @staticmethod
     def check_partitions(
         backend: QnnExecuTorchBackendType, partitions: List[Any]
@@ -224,6 +258,7 @@ class QnnPartitioner(Partitioner):
         if self.check_partitions(self.backend, partitions):
             self.tag_nodes(partitions, edge_program)
             tag_constant_data(edge_program)
+            self.untag_mutable_parameters(edge_program)
             if not self.skip_mutable_buffer:
                 logger.info(
                     "Qnn partitioner will delegate torch mutable buffer with the same I/O address during the runtime, "

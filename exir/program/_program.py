@@ -1755,7 +1755,11 @@ class EdgeProgramManager:
                 program = quant_fusion_and_const_prop_pass(program)
             if config.run_reinplace_pass:
                 program = reinplace_pass(program)
-            program = weights_to_outputs_pass(program)
+            program = weights_to_outputs_pass(
+                program,
+                include_all_parameters=config.external_mutable_weights_from_forward,
+                parameter_names=config.external_mutable_weight_names,
+            )
             program = unsafe_remove_auto_functionalized_pass(program)
             gm, new_signature = insert_write_back_for_buffers_pass(program)
             new_gm = program.graph_module

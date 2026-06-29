@@ -14,6 +14,16 @@
 #include <executorch/backends/qualcomm/runtime/backends/QnnCustomProtocol.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/backend/options.h>
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 namespace executorch {
 namespace backends {
 namespace qnn {
@@ -29,6 +39,111 @@ using executorch::runtime::FreeableBuffer;
 using executorch::runtime::MemoryAllocator;
 using executorch::runtime::Result;
 using executorch::runtime::Span;
+
+namespace {
+
+uint64_t elapsed_us(
+    const std::chrono::high_resolution_clock::time_point& start,
+    const std::chrono::high_resolution_clock::time_point& end) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+          .count());
+}
+
+} // namespace
+
+namespace {
+
+struct SharedOutputBinding {
+  void* buffer = nullptr;
+  size_t bytes = 0;
+};
+
+struct SharedOutputCopyback {
+  void* dst = nullptr;
+  void* src = nullptr;
+  size_t bytes = 0;
+};
+
+std::mutex& PmdHiddenSlotRegistryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_set<std::string>& PmdHiddenSlotRegisteredNames() {
+  static std::unordered_set<std::string> names;
+  return names;
+}
+
+bool PmdHiddenLoraBypassEnabled() {
+  const char* enabled =
+      std::getenv("QNN_EXECUTORCH_PMD_BYPASS_LORA_INPUTS");
+  return enabled != nullptr && std::string(enabled) == "1";
+}
+
+bool IsPmdHiddenLoraInput(const std::string& tensor_name) {
+  if (!PmdHiddenLoraBypassEnabled()) {
+    return false;
+  }
+  std::string lower_name = tensor_name;
+  std::transform(
+      lower_name.begin(),
+      lower_name.end(),
+      lower_name.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return lower_name.find("_lora_a") != std::string::npos ||
+      lower_name.find("_lora_b") != std::string::npos;
+}
+
+bool IsPmdHiddenSlotRegistered(const std::string& tensor_name) {
+  std::lock_guard<std::mutex> guard(PmdHiddenSlotRegistryMutex());
+  return PmdHiddenSlotRegisteredNames().count(tensor_name) != 0;
+}
+
+void MarkPmdHiddenSlotRegistered(const std::string& tensor_name) {
+  std::lock_guard<std::mutex> guard(PmdHiddenSlotRegistryMutex());
+  PmdHiddenSlotRegisteredNames().insert(tensor_name);
+}
+
+bool SharedOutputCopybackEnabled() {
+  const char* enabled =
+      std::getenv("QNN_EXECUTORCH_SHARED_OUTPUT_COPYBACK");
+  return enabled != nullptr && std::string(enabled) == "1";
+}
+
+std::mutex& SharedOutputRegistryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, SharedOutputBinding>& SharedOutputBindings() {
+  static std::unordered_map<std::string, SharedOutputBinding> bindings;
+  return bindings;
+}
+
+SharedOutputBinding* GetOrCreateSharedOutputBinding(
+    const std::string& key,
+    const size_t bytes) {
+  std::lock_guard<std::mutex> guard(SharedOutputRegistryMutex());
+  auto& bindings = SharedOutputBindings();
+  auto it = bindings.find(key);
+  if (it != bindings.end()) {
+    if (it->second.bytes == bytes && it->second.buffer != nullptr) {
+      return &it->second;
+    }
+    return nullptr;
+  }
+  void* buffer = QnnExecuTorchAllocCustomMem(
+      bytes, executorch::runtime::MemoryAllocator::kDefaultAlignment);
+  if (buffer == nullptr) {
+    return nullptr;
+  }
+  QnnExecuTorchAddCustomMemTensorAddr(buffer, buffer);
+  auto [inserted, _] = bindings.emplace(key, SharedOutputBinding{buffer, bytes});
+  return &inserted->second;
+}
+
+} // namespace
 
 // ========== Public method implementations =========================
 constexpr const char* QNN_COMPILE_SPEC = "qnn_compile_spec";
@@ -125,6 +240,8 @@ Error QnnExecuTorchBackend::execute(
     BackendExecutionContext& context,
     DelegateHandle* handle,
     Span<EValue*> args) const {
+  const auto backend_start = std::chrono::high_resolution_clock::now();
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnBackendExecute, 1);
   ET_CHECK_OR_RETURN_ERROR(
       delegate_map_rev_.count(handle) != 0,
       Internal,
@@ -138,55 +255,120 @@ Error QnnExecuTorchBackend::execute(
       qnn_manager->GetGraphOutputs(method_name);
   std::vector<Qnn_Tensor_t> input_tensor_structs;
   std::vector<Qnn_Tensor_t> output_tensor_structs;
+  std::vector<SharedOutputCopyback> shared_output_copybacks;
+  const bool shared_output_copyback_enabled = SharedOutputCopybackEnabled();
 
   int args_index = 0;
   input_tensor_structs.reserve(input_tensors.size());
+  const auto input_prepare_start = std::chrono::high_resolution_clock::now();
   for (const auto& input_tensor : input_tensors) {
     if (input_tensor->GetName().find("mutbuf_") == std::string::npos) {
-      if (qnn_manager->RegisterMem(
-              args[args_index]->toTensor().mutable_data_ptr(), input_tensor) !=
-          Error::Ok) {
-        // update data ptr only should be fine
-        input_tensor->FillDataBuffer(
-            args[args_index]->toTensor().const_data_ptr());
-        // use the real input shape instead of nominal one to make sure
-        // dynamic shape is functional
-        auto dims = args[args_index]->toTensor().sizes();
-        input_tensor->SetDims(dims.data(), dims.size());
+      const bool is_pmd_hidden_slot =
+          IsPmdHiddenLoraInput(input_tensor->GetName());
+      const bool can_bypass_hidden_slot =
+          is_pmd_hidden_slot &&
+          IsPmdHiddenSlotRegistered(input_tensor->GetName());
+      if (can_bypass_hidden_slot) {
+        QnnExecuTorchAotDiagAdd(kAotDiagQnnPmdHiddenSlotBypass, 1);
+      } else {
+        const Error register_result = qnn_manager->RegisterMem(
+            args[args_index]->toTensor().mutable_data_ptr(), input_tensor);
+        if (register_result == Error::Ok) {
+          if (is_pmd_hidden_slot) {
+            MarkPmdHiddenSlotRegistered(input_tensor->GetName());
+          }
+        } else {
+          QnnExecuTorchAotDiagAdd(kAotDiagQnnRegisterMemFallback, 1);
+          // update data ptr only should be fine
+          input_tensor->FillDataBuffer(
+              args[args_index]->toTensor().const_data_ptr());
+          // use the real input shape instead of nominal one to make sure
+          // dynamic shape is functional
+          auto dims = args[args_index]->toTensor().sizes();
+          input_tensor->SetDims(dims.data(), dims.size());
+        }
       }
       args_index++;
     }
     input_tensor_structs.emplace_back(input_tensor->CloneTensorStruct());
   }
+  const auto input_prepare_end = std::chrono::high_resolution_clock::now();
+  QnnExecuTorchAotDiagAdd(
+      kAotDiagQnnPrepareInputsUs,
+      elapsed_us(input_prepare_start, input_prepare_end));
 
+  const auto output_prepare_start = std::chrono::high_resolution_clock::now();
   for (const auto& output_tensor : output_tensors) {
     // pos=0 limits the search to the prefix
     if (output_tensor->GetName().rfind("output_", 0) == 0 &&
         output_tensor->GetName().find("mutbuf_") == std::string::npos) {
       void* mutable_data_ptr = args[args_index]->toTensor().mutable_data_ptr();
-      if (qnn_manager->RegisterMem(mutable_data_ptr, output_tensor) !=
-          Error::Ok) {
+      Error register_result = Error::Internal;
+      if (shared_output_copyback_enabled) {
+        const std::string key = method_name + ":" + output_tensor->GetName() +
+            ":" + std::to_string(output_tensor->GetBytes());
+        SharedOutputBinding* binding =
+            GetOrCreateSharedOutputBinding(key, output_tensor->GetBytes());
+        if (binding != nullptr) {
+          register_result =
+              qnn_manager->RegisterMem(binding->buffer, output_tensor);
+          if (register_result == Error::Ok) {
+            shared_output_copybacks.push_back(
+                SharedOutputCopyback{
+                    mutable_data_ptr, binding->buffer, binding->bytes});
+          }
+        }
+      } else {
+        register_result =
+            qnn_manager->RegisterMem(mutable_data_ptr, output_tensor);
+      }
+      if (register_result != Error::Ok) {
+        QnnExecuTorchAotDiagAdd(kAotDiagQnnRegisterMemFallback, 1);
         output_tensor->FillDataBuffer(mutable_data_ptr);
       }
       args_index++;
     }
     output_tensor_structs.push_back(output_tensor->CloneTensorStruct());
   }
+  const auto output_prepare_end = std::chrono::high_resolution_clock::now();
+  QnnExecuTorchAotDiagAdd(
+      kAotDiagQnnPrepareOutputsUs,
+      elapsed_us(output_prepare_start, output_prepare_end));
 
+  const auto graph_execute_start = std::chrono::high_resolution_clock::now();
+  const Error execute_result = qnn_manager->Execute(
+      method_name,
+      input_tensor_structs,
+      output_tensor_structs,
+      context.event_tracer());
+  const auto graph_execute_end = std::chrono::high_resolution_clock::now();
+  QnnExecuTorchAotDiagAdd(
+      kAotDiagQnnGraphExecuteUs,
+      elapsed_us(graph_execute_start, graph_execute_end));
   ET_CHECK_OR_RETURN_ERROR(
-      qnn_manager->Execute(
-          method_name,
-          input_tensor_structs,
-          output_tensor_structs,
-          context.event_tracer()) == Error::Ok,
+      execute_result == Error::Ok,
       Internal,
       "Fail to execute graph");
+  const auto copyback_start = std::chrono::high_resolution_clock::now();
+  for (const SharedOutputCopyback& copyback : shared_output_copybacks) {
+    std::memcpy(copyback.dst, copyback.src, copyback.bytes);
+    QnnExecuTorchAotDiagAdd(kAotDiagQnnSharedOutputCopyback, 1);
+    QnnExecuTorchAotDiagAdd(
+        kAotDiagQnnSharedOutputCopybackBytes, copyback.bytes);
+  }
+  const auto copyback_end = std::chrono::high_resolution_clock::now();
+  QnnExecuTorchAotDiagAdd(
+      kAotDiagQnnSharedOutputCopybackUs,
+      elapsed_us(copyback_start, copyback_end));
   ET_CHECK_OR_RETURN_ERROR(
       qnn_manager->ProfileExecuteData(method_name, context.event_tracer()) ==
           Error::Ok,
       Internal,
       "Fail to profile graph");
 
+  const auto backend_end = std::chrono::high_resolution_clock::now();
+  QnnExecuTorchAotDiagAdd(
+      kAotDiagQnnBackendExecuteUs, elapsed_us(backend_start, backend_end));
   return Error::Ok;
 }
 

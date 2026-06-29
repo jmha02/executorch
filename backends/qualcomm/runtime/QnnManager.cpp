@@ -13,11 +13,70 @@
 #include <executorch/backends/qualcomm/runtime/backends/QnnCustomProtocol.h>
 #include <executorch/backends/qualcomm/runtime/backends/QnnImplementation.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
 #include <unordered_map>
+
+namespace {
+
+struct AtomicAotDiagCounters {
+  std::atomic<uint64_t> qnn_backend_execute_count{0};
+  std::atomic<uint64_t> qnn_register_mem_check_count{0};
+  std::atomic<uint64_t> qnn_register_mem_fallback_count{0};
+  std::atomic<uint64_t> qnn_register_mem_custom_base_hit_count{0};
+  std::atomic<uint64_t> qnn_register_mem_custom_base_miss_count{0};
+  std::atomic<uint64_t> qnn_register_ion_attempt_count{0};
+  std::atomic<uint64_t> qnn_register_custom_mem_entry_count{0};
+  std::atomic<uint64_t> qnn_shared_buffer_current_hit_count{0};
+  std::atomic<uint64_t> qnn_shared_buffer_preregistered_hit_count{0};
+  std::atomic<uint64_t> qnn_mem_register_count{0};
+  std::atomic<uint64_t> qnn_ion_mem_register_count{0};
+  std::atomic<uint64_t> qnn_custom_mem_register_count{0};
+  std::atomic<uint64_t> qnn_set_mem_handle_count{0};
+  std::atomic<uint64_t> qnn_fill_data_buffer_count{0};
+  std::atomic<uint64_t> qnn_fill_data_buffer_bytes{0};
+  std::atomic<uint64_t> qnn_backend_execute_us{0};
+  std::atomic<uint64_t> qnn_prepare_inputs_us{0};
+  std::atomic<uint64_t> qnn_prepare_outputs_us{0};
+  std::atomic<uint64_t> qnn_graph_execute_us{0};
+  std::atomic<uint64_t> qnn_shared_output_copyback_us{0};
+  std::atomic<uint64_t> qnn_graph_execute_count{0};
+  std::atomic<uint64_t> qnn_context_create_count{0};
+  std::atomic<uint64_t> qnn_context_create_from_binary_count{0};
+  std::atomic<uint64_t> qnn_graph_finalize_count{0};
+  std::atomic<uint64_t> qnn_custom_mem_dtype_float32_count{0};
+  std::atomic<uint64_t> qnn_custom_mem_dtype_float16_count{0};
+  std::atomic<uint64_t> qnn_custom_mem_dtype_other_count{0};
+  std::atomic<uint64_t> rpcmem_alloc_count{0};
+  std::atomic<uint64_t> rpcmem_free_count{0};
+  std::atomic<uint64_t> rpcmem_total_bytes{0};
+  std::atomic<uint64_t> custom_mem_addr_map_count{0};
+  std::atomic<uint64_t> custom_mem_addr_hit_count{0};
+  std::atomic<uint64_t> custom_mem_addr_miss_count{0};
+  std::atomic<uint64_t> qnn_pmd_hidden_slot_bypass_count{0};
+  std::atomic<uint64_t> qnn_shared_output_copyback_count{0};
+  std::atomic<uint64_t> qnn_shared_output_copyback_bytes{0};
+};
+
+std::atomic<bool> g_aot_diag_enabled{false};
+AtomicAotDiagCounters g_aot_diag_counters;
+
+uint64_t load_counter(const std::atomic<uint64_t>& counter) {
+  return counter.load(std::memory_order_relaxed);
+}
+
+void reset_counter(std::atomic<uint64_t>& counter) {
+  counter.store(0, std::memory_order_relaxed);
+}
+
+void add_counter(std::atomic<uint64_t>& counter, uint64_t value) {
+  counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+} // namespace
 
 namespace executorch {
 namespace backends {
@@ -96,6 +155,7 @@ QnnManager::QnnManager(
 Error QnnManager::RegisterMem(
     void* data_ptr,
     const std::shared_ptr<TensorWrapper>& tensor_wrapper) {
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnRegisterMemCheck, 1);
   SharedBuffer& shared_buffer_manager = SharedBuffer::GetSharedBufferManager();
   // Not enable shared buffer
   if (!options_->shared_buffer()) {
@@ -112,14 +172,17 @@ Error QnnManager::RegisterMem(
 
   void* custom_mem_base = shared_buffer_manager.GetCustomMemBase(data_ptr);
   if (custom_mem_base != nullptr) {
+    QnnExecuTorchAotDiagAdd(kAotDiagQnnRegisterMemCustomBaseHit, 1);
     return RegisterCustomMem(data_ptr, custom_mem_base, tensor_wrapper);
   }
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnRegisterMemCustomBaseMiss, 1);
   return RegisterIonMem(data_ptr, tensor_wrapper);
 }
 
 Error QnnManager::RegisterIonMem(
     void* data_ptr,
     const std::shared_ptr<TensorWrapper>& tensor_wrapper) {
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnRegisterIonAttempt, 1);
   SharedBuffer& shared_buffer_manager = SharedBuffer::GetSharedBufferManager();
   if (!shared_buffer_manager.IsAllocated(data_ptr)) {
     // It means two scenarios here:
@@ -157,8 +220,10 @@ Error QnnManager::RegisterCustomMem(
     void* data_ptr,
     void* custom_mem_base,
     const std::shared_ptr<TensorWrapper>& tensor_wrapper) {
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnRegisterCustomMemEntry, 1);
   if (backend_params_ptr_->qnn_mem_manager_ptr_->IsRegistered(
           tensor_wrapper->GetMemHandle(), data_ptr)) {
+    QnnExecuTorchAotDiagAdd(kAotDiagQnnSharedBufferCurrentHit, 1);
     if (get_option(options_->log_level(), QNN_RUNTIME_LOG_LEVEL) >=
         QnnExecuTorchLogLevel::kLogLevelInfo)
       QNN_EXECUTORCH_LOG_INFO(
@@ -183,6 +248,7 @@ Error QnnManager::RegisterCustomMem(
   // This applies when running llama in lookahead mode with the same AR-N model
   // handling both the prompt processor and the token generator.
   if (pre_registered_handle != nullptr) {
+    QnnExecuTorchAotDiagAdd(kAotDiagQnnSharedBufferPreregisteredHit, 1);
     if (get_option(options_->log_level(), QNN_RUNTIME_LOG_LEVEL) >=
         QnnExecuTorchLogLevel::kLogLevelInfo) {
       QNN_EXECUTORCH_LOG_INFO(
@@ -208,6 +274,18 @@ Error QnnManager::RegisterCustomMem(
         "Tensor name %s failed to get file descriptor.",
         tensor_wrapper->GetName().c_str());
     return Error::Internal;
+  }
+
+  switch (tensor_wrapper->GetDataType()) {
+    case QNN_DATATYPE_FLOAT_32:
+      QnnExecuTorchAotDiagAdd(kAotDiagQnnCustomMemDtypeFloat32, 1);
+      break;
+    case QNN_DATATYPE_FLOAT_16:
+      QnnExecuTorchAotDiagAdd(kAotDiagQnnCustomMemDtypeFloat16, 1);
+      break;
+    default:
+      QnnExecuTorchAotDiagAdd(kAotDiagQnnCustomMemDtypeOther, 1);
+      break;
   }
 
   ET_CHECK_OR_RETURN_ERROR(
@@ -407,6 +485,7 @@ Error QnnManager::Execute(
     executorch::runtime::EventTracer* event_tracer) {
   Qnn_ErrorHandle_t error = QNN_SUCCESS;
 
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnGraphExecute, 1);
   error = backend_params_ptr_->qnn_graph_ptr_->GraphExecute(
       graph_name, input_tensor_structs, output_tensor_structs);
 
@@ -545,6 +624,7 @@ Error QnnManager::CompileDlc() {
     auto& graphInfo = (*qnn_dlc_graph_info)[i];
     backend_params_ptr_->qnn_graph_ptr_->SetGraphHandle(
         graphInfo.graphName, graphInfo.graph);
+    QnnExecuTorchAotDiagAdd(kAotDiagQnnGraphFinalize, 1);
     error =
         backend_params_ptr_->qnn_graph_ptr_->GraphFinalize(graphInfo.graphName);
     if (error != QNN_SUCCESS) {
@@ -647,6 +727,7 @@ Error QnnManager::Compile(
       return Error::Internal;
     }
   }
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnGraphFinalize, 1);
   error = qnn_graph_ptr->GraphFinalize(graph_name);
   if (error != QNN_SUCCESS) {
     QNN_EXECUTORCH_LOG_ERROR(
@@ -675,4 +756,250 @@ void QnnExecuTorchFreeCustomMem(void* buffer_ptr) {
 void QnnExecuTorchAddCustomMemTensorAddr(void* tensor_addr, void* custom_mem) {
   executorch::backends::qnn::SharedBuffer::GetSharedBufferManager()
       .AddCusomMemTensorAddr(tensor_addr, custom_mem);
+}
+
+void QnnExecuTorchAotDiagSetEnabled(int enabled) {
+  g_aot_diag_enabled.store(enabled != 0, std::memory_order_relaxed);
+}
+
+int QnnExecuTorchAotDiagIsEnabled() {
+  return g_aot_diag_enabled.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+void QnnExecuTorchAotDiagReset() {
+  reset_counter(g_aot_diag_counters.qnn_backend_execute_count);
+  reset_counter(g_aot_diag_counters.qnn_register_mem_check_count);
+  reset_counter(g_aot_diag_counters.qnn_register_mem_fallback_count);
+  reset_counter(g_aot_diag_counters.qnn_register_mem_custom_base_hit_count);
+  reset_counter(g_aot_diag_counters.qnn_register_mem_custom_base_miss_count);
+  reset_counter(g_aot_diag_counters.qnn_register_ion_attempt_count);
+  reset_counter(g_aot_diag_counters.qnn_register_custom_mem_entry_count);
+  reset_counter(g_aot_diag_counters.qnn_shared_buffer_current_hit_count);
+  reset_counter(g_aot_diag_counters.qnn_shared_buffer_preregistered_hit_count);
+  reset_counter(g_aot_diag_counters.qnn_mem_register_count);
+  reset_counter(g_aot_diag_counters.qnn_ion_mem_register_count);
+  reset_counter(g_aot_diag_counters.qnn_custom_mem_register_count);
+  reset_counter(g_aot_diag_counters.qnn_set_mem_handle_count);
+  reset_counter(g_aot_diag_counters.qnn_fill_data_buffer_count);
+  reset_counter(g_aot_diag_counters.qnn_fill_data_buffer_bytes);
+  reset_counter(g_aot_diag_counters.qnn_backend_execute_us);
+  reset_counter(g_aot_diag_counters.qnn_prepare_inputs_us);
+  reset_counter(g_aot_diag_counters.qnn_prepare_outputs_us);
+  reset_counter(g_aot_diag_counters.qnn_graph_execute_us);
+  reset_counter(g_aot_diag_counters.qnn_shared_output_copyback_us);
+  reset_counter(g_aot_diag_counters.qnn_graph_execute_count);
+  reset_counter(g_aot_diag_counters.qnn_context_create_count);
+  reset_counter(g_aot_diag_counters.qnn_context_create_from_binary_count);
+  reset_counter(g_aot_diag_counters.qnn_graph_finalize_count);
+  reset_counter(g_aot_diag_counters.qnn_custom_mem_dtype_float32_count);
+  reset_counter(g_aot_diag_counters.qnn_custom_mem_dtype_float16_count);
+  reset_counter(g_aot_diag_counters.qnn_custom_mem_dtype_other_count);
+  reset_counter(g_aot_diag_counters.rpcmem_alloc_count);
+  reset_counter(g_aot_diag_counters.rpcmem_free_count);
+  reset_counter(g_aot_diag_counters.rpcmem_total_bytes);
+  reset_counter(g_aot_diag_counters.custom_mem_addr_map_count);
+  reset_counter(g_aot_diag_counters.custom_mem_addr_hit_count);
+  reset_counter(g_aot_diag_counters.custom_mem_addr_miss_count);
+  reset_counter(g_aot_diag_counters.qnn_pmd_hidden_slot_bypass_count);
+  reset_counter(g_aot_diag_counters.qnn_shared_output_copyback_count);
+  reset_counter(g_aot_diag_counters.qnn_shared_output_copyback_bytes);
+}
+
+void QnnExecuTorchAotDiagAdd(int counter, uint64_t value) {
+  if (!g_aot_diag_enabled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  switch (counter) {
+    case kAotDiagQnnBackendExecute:
+      add_counter(g_aot_diag_counters.qnn_backend_execute_count, value);
+      break;
+    case kAotDiagQnnRegisterMemCheck:
+      add_counter(g_aot_diag_counters.qnn_register_mem_check_count, value);
+      break;
+    case kAotDiagQnnRegisterMemFallback:
+      add_counter(g_aot_diag_counters.qnn_register_mem_fallback_count, value);
+      break;
+    case kAotDiagQnnRegisterMemCustomBaseHit:
+      add_counter(
+          g_aot_diag_counters.qnn_register_mem_custom_base_hit_count, value);
+      break;
+    case kAotDiagQnnRegisterMemCustomBaseMiss:
+      add_counter(
+          g_aot_diag_counters.qnn_register_mem_custom_base_miss_count, value);
+      break;
+    case kAotDiagQnnRegisterIonAttempt:
+      add_counter(g_aot_diag_counters.qnn_register_ion_attempt_count, value);
+      break;
+    case kAotDiagQnnRegisterCustomMemEntry:
+      add_counter(g_aot_diag_counters.qnn_register_custom_mem_entry_count, value);
+      break;
+    case kAotDiagQnnSharedBufferCurrentHit:
+      add_counter(g_aot_diag_counters.qnn_shared_buffer_current_hit_count, value);
+      break;
+    case kAotDiagQnnSharedBufferPreregisteredHit:
+      add_counter(
+          g_aot_diag_counters.qnn_shared_buffer_preregistered_hit_count, value);
+      break;
+    case kAotDiagQnnMemRegister:
+      add_counter(g_aot_diag_counters.qnn_mem_register_count, value);
+      break;
+    case kAotDiagQnnIonMemRegister:
+      add_counter(g_aot_diag_counters.qnn_ion_mem_register_count, value);
+      break;
+    case kAotDiagQnnCustomMemRegister:
+      add_counter(g_aot_diag_counters.qnn_custom_mem_register_count, value);
+      break;
+    case kAotDiagQnnSetMemHandle:
+      add_counter(g_aot_diag_counters.qnn_set_mem_handle_count, value);
+      break;
+    case kAotDiagQnnFillDataBuffer:
+      add_counter(g_aot_diag_counters.qnn_fill_data_buffer_count, value);
+      break;
+    case kAotDiagQnnFillDataBufferBytes:
+      add_counter(g_aot_diag_counters.qnn_fill_data_buffer_bytes, value);
+      break;
+    case kAotDiagQnnBackendExecuteUs:
+      add_counter(g_aot_diag_counters.qnn_backend_execute_us, value);
+      break;
+    case kAotDiagQnnPrepareInputsUs:
+      add_counter(g_aot_diag_counters.qnn_prepare_inputs_us, value);
+      break;
+    case kAotDiagQnnPrepareOutputsUs:
+      add_counter(g_aot_diag_counters.qnn_prepare_outputs_us, value);
+      break;
+    case kAotDiagQnnGraphExecuteUs:
+      add_counter(g_aot_diag_counters.qnn_graph_execute_us, value);
+      break;
+    case kAotDiagQnnSharedOutputCopybackUs:
+      add_counter(g_aot_diag_counters.qnn_shared_output_copyback_us, value);
+      break;
+    case kAotDiagQnnGraphExecute:
+      add_counter(g_aot_diag_counters.qnn_graph_execute_count, value);
+      break;
+    case kAotDiagQnnContextCreate:
+      add_counter(g_aot_diag_counters.qnn_context_create_count, value);
+      break;
+    case kAotDiagQnnContextCreateFromBinary:
+      add_counter(g_aot_diag_counters.qnn_context_create_from_binary_count, value);
+      break;
+    case kAotDiagQnnGraphFinalize:
+      add_counter(g_aot_diag_counters.qnn_graph_finalize_count, value);
+      break;
+    case kAotDiagQnnCustomMemDtypeFloat32:
+      add_counter(g_aot_diag_counters.qnn_custom_mem_dtype_float32_count, value);
+      break;
+    case kAotDiagQnnCustomMemDtypeFloat16:
+      add_counter(g_aot_diag_counters.qnn_custom_mem_dtype_float16_count, value);
+      break;
+    case kAotDiagQnnCustomMemDtypeOther:
+      add_counter(g_aot_diag_counters.qnn_custom_mem_dtype_other_count, value);
+      break;
+    case kAotDiagRpcmemAlloc:
+      add_counter(g_aot_diag_counters.rpcmem_alloc_count, value);
+      break;
+    case kAotDiagRpcmemFree:
+      add_counter(g_aot_diag_counters.rpcmem_free_count, value);
+      break;
+    case kAotDiagRpcmemTotalBytes:
+      add_counter(g_aot_diag_counters.rpcmem_total_bytes, value);
+      break;
+    case kAotDiagCustomMemAddrMap:
+      add_counter(g_aot_diag_counters.custom_mem_addr_map_count, value);
+      break;
+    case kAotDiagCustomMemAddrHit:
+      add_counter(g_aot_diag_counters.custom_mem_addr_hit_count, value);
+      break;
+    case kAotDiagCustomMemAddrMiss:
+      add_counter(g_aot_diag_counters.custom_mem_addr_miss_count, value);
+      break;
+    case kAotDiagQnnPmdHiddenSlotBypass:
+      add_counter(g_aot_diag_counters.qnn_pmd_hidden_slot_bypass_count, value);
+      break;
+    case kAotDiagQnnSharedOutputCopyback:
+      add_counter(g_aot_diag_counters.qnn_shared_output_copyback_count, value);
+      break;
+    case kAotDiagQnnSharedOutputCopybackBytes:
+      add_counter(g_aot_diag_counters.qnn_shared_output_copyback_bytes, value);
+      break;
+    default:
+      break;
+  }
+}
+
+void QnnExecuTorchAotDiagGet(QnnExecuTorchAotDiagCounters* counters) {
+  if (counters == nullptr) {
+    return;
+  }
+  counters->qnn_backend_execute_count =
+      load_counter(g_aot_diag_counters.qnn_backend_execute_count);
+  counters->qnn_register_mem_check_count =
+      load_counter(g_aot_diag_counters.qnn_register_mem_check_count);
+  counters->qnn_register_mem_fallback_count =
+      load_counter(g_aot_diag_counters.qnn_register_mem_fallback_count);
+  counters->qnn_register_mem_custom_base_hit_count =
+      load_counter(g_aot_diag_counters.qnn_register_mem_custom_base_hit_count);
+  counters->qnn_register_mem_custom_base_miss_count =
+      load_counter(g_aot_diag_counters.qnn_register_mem_custom_base_miss_count);
+  counters->qnn_register_ion_attempt_count =
+      load_counter(g_aot_diag_counters.qnn_register_ion_attempt_count);
+  counters->qnn_register_custom_mem_entry_count =
+      load_counter(g_aot_diag_counters.qnn_register_custom_mem_entry_count);
+  counters->qnn_shared_buffer_current_hit_count =
+      load_counter(g_aot_diag_counters.qnn_shared_buffer_current_hit_count);
+  counters->qnn_shared_buffer_preregistered_hit_count =
+      load_counter(g_aot_diag_counters.qnn_shared_buffer_preregistered_hit_count);
+  counters->qnn_mem_register_count =
+      load_counter(g_aot_diag_counters.qnn_mem_register_count);
+  counters->qnn_ion_mem_register_count =
+      load_counter(g_aot_diag_counters.qnn_ion_mem_register_count);
+  counters->qnn_custom_mem_register_count =
+      load_counter(g_aot_diag_counters.qnn_custom_mem_register_count);
+  counters->qnn_set_mem_handle_count =
+      load_counter(g_aot_diag_counters.qnn_set_mem_handle_count);
+  counters->qnn_fill_data_buffer_count =
+      load_counter(g_aot_diag_counters.qnn_fill_data_buffer_count);
+  counters->qnn_fill_data_buffer_bytes =
+      load_counter(g_aot_diag_counters.qnn_fill_data_buffer_bytes);
+  counters->qnn_backend_execute_us =
+      load_counter(g_aot_diag_counters.qnn_backend_execute_us);
+  counters->qnn_prepare_inputs_us =
+      load_counter(g_aot_diag_counters.qnn_prepare_inputs_us);
+  counters->qnn_prepare_outputs_us =
+      load_counter(g_aot_diag_counters.qnn_prepare_outputs_us);
+  counters->qnn_graph_execute_us =
+      load_counter(g_aot_diag_counters.qnn_graph_execute_us);
+  counters->qnn_shared_output_copyback_us =
+      load_counter(g_aot_diag_counters.qnn_shared_output_copyback_us);
+  counters->qnn_graph_execute_count =
+      load_counter(g_aot_diag_counters.qnn_graph_execute_count);
+  counters->qnn_context_create_count =
+      load_counter(g_aot_diag_counters.qnn_context_create_count);
+  counters->qnn_context_create_from_binary_count =
+      load_counter(g_aot_diag_counters.qnn_context_create_from_binary_count);
+  counters->qnn_graph_finalize_count =
+      load_counter(g_aot_diag_counters.qnn_graph_finalize_count);
+  counters->qnn_custom_mem_dtype_float32_count =
+      load_counter(g_aot_diag_counters.qnn_custom_mem_dtype_float32_count);
+  counters->qnn_custom_mem_dtype_float16_count =
+      load_counter(g_aot_diag_counters.qnn_custom_mem_dtype_float16_count);
+  counters->qnn_custom_mem_dtype_other_count =
+      load_counter(g_aot_diag_counters.qnn_custom_mem_dtype_other_count);
+  counters->rpcmem_alloc_count =
+      load_counter(g_aot_diag_counters.rpcmem_alloc_count);
+  counters->rpcmem_free_count =
+      load_counter(g_aot_diag_counters.rpcmem_free_count);
+  counters->rpcmem_total_bytes =
+      load_counter(g_aot_diag_counters.rpcmem_total_bytes);
+  counters->custom_mem_addr_map_count =
+      load_counter(g_aot_diag_counters.custom_mem_addr_map_count);
+  counters->custom_mem_addr_hit_count =
+      load_counter(g_aot_diag_counters.custom_mem_addr_hit_count);
+  counters->custom_mem_addr_miss_count =
+      load_counter(g_aot_diag_counters.custom_mem_addr_miss_count);
+  counters->qnn_pmd_hidden_slot_bypass_count =
+      load_counter(g_aot_diag_counters.qnn_pmd_hidden_slot_bypass_count);
+  counters->qnn_shared_output_copyback_count =
+      load_counter(g_aot_diag_counters.qnn_shared_output_copyback_count);
+  counters->qnn_shared_output_copyback_bytes =
+      load_counter(g_aot_diag_counters.qnn_shared_output_copyback_bytes);
 }

@@ -89,7 +89,7 @@ def _remove_non_user_outputs(exported_program: ExportedProgram) -> torch.fx.Grap
 # For each entry point in the model, determine if its a joint graph,
 # and if it is return a map of the indices in the model output that the
 # gradient outputs start at and that the parameter outputs start at.
-def _get_training_metadata(methods: Dict[str, ExportedProgram]) -> Dict[str, int]:
+def _get_training_metadata(methods: Dict[str, ExportedProgram]) -> Dict[str, Any]:
     gradients_method_prefix = "__et_training_gradients_index_"
     parameters_method_prefix = "__et_training_parameters_index_"
     fqn_method_prefix = "__et_training_fqn_"
@@ -99,19 +99,24 @@ def _get_training_metadata(methods: Dict[str, ExportedProgram]) -> Dict[str, int
         found_param = False
         fqns = []
         i = 0
+        inputs_to_parameters = method.graph_signature.inputs_to_parameters
         for output_spec in method.graph_signature.output_specs:
             if output_spec.kind == OutputKind.GRADIENT_TO_PARAMETER:
                 if not found_grad:
                     training_metadata[gradients_method_prefix + name] = i
                     found_grad = True
                 fqns.append(output_spec.target)
-            elif output_spec.kind == OutputKind.TOKEN and not found_param:
-                assert found_grad  # Params must come after gradients
-                training_metadata[parameters_method_prefix + name] = i
-                found_param = True
+            elif output_spec.kind == OutputKind.TOKEN:
+                if not found_param:
+                    training_metadata[parameters_method_prefix + name] = i
+                    found_param = True
+                if not found_grad and hasattr(output_spec.arg, "name"):
+                    token_name = output_spec.arg.name
+                    if token_name in inputs_to_parameters:
+                        fqns.append(inputs_to_parameters[token_name])
             i += 1
-            if len(fqns) > 0:
-                training_metadata[fqn_method_prefix + name] = fqns
+        if len(fqns) > 0:
+            training_metadata[fqn_method_prefix + name] = fqns
     return training_metadata
 
 

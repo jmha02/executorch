@@ -158,13 +158,19 @@ class Method final {
    * specified tensor.
    *
    * @param[in] output_idx The index of the output to set the data_ptr for. Must
-   *     correspond to a tensor, and that tensor must not have had a buffer
-   *     allocated by the memory plan.
+   *     correspond to a tensor.
+   * @param[in] allow_memory_planned_output Allow replacing a memory-planned
+   *     output's data pointer with externally owned storage. This is intended
+   *     for explicit output allocators; regular callers should leave it false.
    *
    * @returns Error::Ok on success, non-Ok on failure.
    */
   ET_NODISCARD Error
-  set_output_data_ptr(void* buffer, size_t size, size_t output_idx);
+  set_output_data_ptr(
+      void* buffer,
+      size_t size,
+      size_t output_idx,
+      bool allow_memory_planned_output = false);
 
   /**
    * Copies the method's outputs into the provided array.

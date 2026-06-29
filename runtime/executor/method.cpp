@@ -14,6 +14,8 @@
 #include <cinttypes> // @donotremove
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/event_tracer_hooks.h>
@@ -1341,8 +1343,11 @@ Method::set_inputs(const executorch::aten::ArrayRef<EValue>& input_evalues) {
   return Error::Ok;
 }
 
-ET_NODISCARD Error
-Method::set_output_data_ptr(void* buffer, size_t size, size_t output_idx) {
+ET_NODISCARD Error Method::set_output_data_ptr(
+    void* buffer,
+    size_t size,
+    size_t output_idx,
+    bool allow_memory_planned_output) {
   // Check method state
   ET_CHECK_OR_RETURN_ERROR(
       initialized(),
@@ -1369,7 +1374,12 @@ Method::set_output_data_ptr(void* buffer, size_t size, size_t output_idx) {
   }
 
   auto tensor_meta = this->method_meta().output_tensor_meta(output_idx);
-  if (tensor_meta->is_memory_planned()) {
+  const char* allow_memory_planned_override =
+      std::getenv("EXECUTORCH_ALLOW_MEMORY_PLANNED_OUTPUT_OVERRIDE");
+  const bool allow_override = allow_memory_planned_override != nullptr &&
+      std::string(allow_memory_planned_override) == "1";
+  if (tensor_meta->is_memory_planned() && !allow_override &&
+      !allow_memory_planned_output) {
     ET_LOG(
         Error,
         "Output %" ET_PRIsize_t
@@ -1377,6 +1387,20 @@ Method::set_output_data_ptr(void* buffer, size_t size, size_t output_idx) {
         "the existing data pointer.",
         output_idx);
     return Error::InvalidState;
+  }
+  if (tensor_meta->is_memory_planned() && allow_override) {
+    ET_LOG(
+        Info,
+        "Overriding memory-planned output %" ET_PRIsize_t
+        " data pointer for diagnostic output binding.",
+        output_idx);
+  }
+  if (tensor_meta->is_memory_planned() && allow_memory_planned_output) {
+    ET_LOG(
+        Info,
+        "Binding memory-planned output %" ET_PRIsize_t
+        " to explicit external storage.",
+        output_idx);
   }
 
   auto& t = output.toTensor();

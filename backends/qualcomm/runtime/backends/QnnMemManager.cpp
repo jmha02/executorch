@@ -33,6 +33,8 @@ Error QnnMemManager::RegisterIonMem(
       {{mem_fd}}};
   Qnn_MemHandle_t handle = nullptr;
   Qnn_ErrorHandle_t error = QNN_SUCCESS;
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnMemRegister, 1);
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnIonMemRegister, 1);
   error = qnn_interface.qnn_mem_register(
       context_->GetHandle(),
       &descriptor,
@@ -81,6 +83,8 @@ Error QnnMemManager::RegisterCustomMem(
 
   descriptor.customInfo = &htp_descriptor;
 
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnMemRegister, 1);
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnCustomMemRegister, 1);
   error = qnn_interface.qnn_mem_register(
       context_->GetHandle(),
       &descriptor,

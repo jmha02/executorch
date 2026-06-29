@@ -340,6 +340,12 @@ runtime::Result<std::vector<size_t>> Module::get_mem_planned_buffer_sizes(
   return sizes;
 }
 
+runtime::Result<std::vector<size_t>> Module::planned_buffer_sizes(
+    const std::string& method_name) {
+  ET_CHECK_OK_OR_RETURN_ERROR(load());
+  return get_mem_planned_buffer_sizes(method_name);
+}
+
 runtime::Result<std::vector<size_t>>
 Module::get_max_mem_planned_buffer_sizes() {
   std::vector<size_t> result;
@@ -480,6 +486,25 @@ runtime::Error Module::set_output(
   const auto& output_tensor = output_value.toTensor();
   return method->set_output_data_ptr(
       output_tensor.mutable_data_ptr(), output_tensor.nbytes(), output_index);
+}
+
+runtime::Error Module::set_output_external_storage(
+    const std::string& method_name,
+    runtime::EValue output_value,
+    size_t output_index) {
+  ET_CHECK_OK_OR_RETURN_ERROR(load_method(method_name));
+  auto& method = methods_.at(method_name).method;
+  ET_CHECK_OR_RETURN_ERROR(
+      output_value.isTensor(),
+      InvalidArgument,
+      "output type: %zu is not tensor",
+      (size_t)output_value.tag);
+  const auto& output_tensor = output_value.toTensor();
+  return method->set_output_data_ptr(
+      output_tensor.mutable_data_ptr(),
+      output_tensor.nbytes(),
+      output_index,
+      /*allow_memory_planned_output=*/true);
 }
 
 runtime::Error Module::set_outputs(
