@@ -146,6 +146,7 @@ class QnnPartitioner(Partitioner):
         skip_node_op_set: set = None,
         skip_mutable_buffer: bool = False,
         mutable_parameter_names: Optional[Sequence[str]] = None,
+        updateable_parameter_names: Optional[Sequence[str]] = None,
     ):
         """
         Args:
@@ -156,7 +157,24 @@ class QnnPartitioner(Partitioner):
             mutable_parameter_names (Sequence[str], optional): Parameter FQNs to keep
                 as top-level mutable values while passing them to the QNN delegate as
                 runtime inputs.
+            updateable_parameter_names (Sequence[str], optional): Parameter FQNs to
+                keep delegated while marking them for updateable-static tensor
+                construction.
         """
+        self.mutable_parameter_names: Set[str] = (
+            set() if mutable_parameter_names is None else set(mutable_parameter_names)
+        )
+        self.updateable_parameter_names: Set[str] = (
+            set()
+            if updateable_parameter_names is None
+            else set(updateable_parameter_names)
+        )
+        overlap = self.mutable_parameter_names & self.updateable_parameter_names
+        if overlap:
+            raise ValueError(
+                "mutable_parameter_names and updateable_parameter_names overlap: "
+                f"{sorted(overlap)}"
+            )
         self.compiler_specs_snapshot = copy.deepcopy(compiler_specs)
         self.backend = flatbuffer_to_option(
             generate_qnn_executorch_option(self.compiler_specs_snapshot)
@@ -169,9 +187,6 @@ class QnnPartitioner(Partitioner):
         self.skip_node_id_set = set() if skip_node_id_set is None else skip_node_id_set
         self.skip_node_op_set = set() if skip_node_op_set is None else skip_node_op_set
         self.skip_mutable_buffer = skip_mutable_buffer
-        self.mutable_parameter_names: Set[str] = (
-            set() if mutable_parameter_names is None else set(mutable_parameter_names)
-        )
 
     def generate_partitions(
         self, edge_program: torch.export.ExportedProgram
@@ -234,6 +249,21 @@ class QnnPartitioner(Partitioner):
             node.meta.pop("delegation_tag", None)
             node.meta["qnn_mutable_parameter_input"] = True
 
+    def mark_updateable_parameters(
+        self, edge_program: torch.export.ExportedProgram
+    ) -> None:
+        if len(self.updateable_parameter_names) == 0:
+            return
+
+        inputs_to_parameters = edge_program.graph_signature.inputs_to_parameters
+        for node in edge_program.graph_module.graph.nodes:
+            if node.op != "placeholder" or node.name not in inputs_to_parameters:
+                continue
+            if inputs_to_parameters[node.name] not in self.updateable_parameter_names:
+                continue
+            if node.meta.get("delegation_tag") is not None:
+                node.meta["qnn_updateable_parameter"] = True
+
     @staticmethod
     def check_partitions(
         backend: QnnExecuTorchBackendType, partitions: List[Any]
@@ -259,6 +289,7 @@ class QnnPartitioner(Partitioner):
             self.tag_nodes(partitions, edge_program)
             tag_constant_data(edge_program)
             self.untag_mutable_parameters(edge_program)
+            self.mark_updateable_parameters(edge_program)
             if not self.skip_mutable_buffer:
                 logger.info(
                     "Qnn partitioner will delegate torch mutable buffer with the same I/O address during the runtime, "

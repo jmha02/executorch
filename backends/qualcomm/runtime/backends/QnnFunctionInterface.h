@@ -56,6 +56,12 @@ class QnnInterface {
   DEFINE_SHIM_FUNCTION_INTERFACE(context_get_binary_size, contextGetBinarySize);
   DEFINE_SHIM_FUNCTION_INTERFACE(context_get_binary, contextGetBinary);
   DEFINE_SHIM_FUNCTION_INTERFACE(
+      context_get_binary_section_size,
+      contextGetBinarySectionSize);
+  DEFINE_SHIM_FUNCTION_INTERFACE(
+      context_get_binary_section,
+      contextGetBinarySection);
+  DEFINE_SHIM_FUNCTION_INTERFACE(
       context_create_from_binary,
       contextCreateFromBinary);
   DEFINE_SHIM_FUNCTION_INTERFACE(context_free, contextFree);
@@ -92,6 +98,9 @@ class QnnInterface {
   DEFINE_SHIM_FUNCTION_INTERFACE(
       tensor_create_graph_tensor,
       tensorCreateGraphTensor);
+  DEFINE_SHIM_FUNCTION_INTERFACE(
+      tensor_update_graph_tensors,
+      tensorUpdateGraphTensors);
 
   void SetQnnInterface(const QnnInterface_t* qnn_interface) {
     qnn_interface_ = qnn_interface;
@@ -103,6 +112,33 @@ class QnnInterface {
 
   bool IsLoaded() const {
     return qnn_interface_ != nullptr;
+  }
+
+  bool HasPropertyHasCapability() const {
+    return IsLoaded() &&
+        qnn_interface_->QNN_INTERFACE_VER_NAME.propertyHasCapability != nullptr;
+  }
+
+  bool HasGraphSetConfig() const {
+    return IsLoaded() &&
+        qnn_interface_->QNN_INTERFACE_VER_NAME.graphSetConfig != nullptr;
+  }
+
+  bool HasContextGetBinarySectionSize() const {
+    return IsLoaded() &&
+        qnn_interface_->QNN_INTERFACE_VER_NAME.contextGetBinarySectionSize !=
+        nullptr;
+  }
+
+  bool HasContextGetBinarySection() const {
+    return IsLoaded() &&
+        qnn_interface_->QNN_INTERFACE_VER_NAME.contextGetBinarySection != nullptr;
+  }
+
+  bool HasTensorUpdateGraphTensors() const {
+    return IsLoaded() &&
+        qnn_interface_->QNN_INTERFACE_VER_NAME.tensorUpdateGraphTensors !=
+        nullptr;
   }
   const QNN_INTERFACE_VER_TYPE& GetInterfaceVer() const {
     return qnn_interface_->QNN_INTERFACE_VER_NAME;

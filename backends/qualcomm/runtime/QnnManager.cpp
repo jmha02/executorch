@@ -64,6 +64,12 @@ struct AtomicAotDiagCounters {
 std::atomic<bool> g_aot_diag_enabled{false};
 AtomicAotDiagCounters g_aot_diag_counters;
 
+bool ShouldOmitBinarySectionWeightsUpdatesConfigForProbe() {
+  const char* value = std::getenv(
+      "EXECUTORCH_QNN_OMIT_BINARY_SECTION_WEIGHTS_UPDATES_CONFIG");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 uint64_t load_counter(const std::atomic<uint64_t>& counter) {
   return counter.load(std::memory_order_relaxed);
 }
@@ -427,12 +433,14 @@ Error QnnManager::AllocateTensor(const std::string& graph_name) {
     }
     input_tensors_[graph_name].emplace_back(std::move(tensor_wrapper));
   }
-  if (!options_->is_from_context_binary()) {
-    std::sort(
-        input_tensors_[graph_name].begin(),
-        input_tensors_[graph_name].end(),
-        CompareExportedInput);
-  }
+  // Always sort by input_{external_id}_ so GetGraphInputs matches call_delegate
+  // args order. Skipping this for context binaries left large HTP-fused graphs
+  // with mixed-rank inputs (e.g. [2,8] tokens + [2,1,8,8] masks) misaligned →
+  // SetDims "2 vs 4" and DSP Error 6004 batch (2, 8).
+  std::sort(
+      input_tensors_[graph_name].begin(),
+      input_tensors_[graph_name].end(),
+      CompareExportedInput);
   for (size_t i = 0; i < output_tensors.size(); ++i) {
     std::shared_ptr<TensorWrapper> tensor_wrapper =
         CreateTensorWrapper(output_tensors[i]);
@@ -616,6 +624,298 @@ Error QnnManager::GetContextBinary(
   return Error::Ok;
 }
 
+Error QnnManager::GetUpdatableWeightsBinarySection(
+    const std::string& graph_name,
+    std::vector<uint8_t>& section) {
+  section.clear();
+  updatable_weights_lifecycle_trace_.section_size_status = QNN_ERROR_UNDEFINED;
+  updatable_weights_lifecycle_trace_.section_extraction_status =
+      QNN_ERROR_UNDEFINED;
+  updatable_weights_lifecycle_trace_.section_bytes = 0;
+  ET_CHECK_OR_RETURN_ERROR(
+      backend_bundle_ptr_ != nullptr &&
+          backend_bundle_ptr_->implementation != nullptr &&
+          backend_params_ptr_ != nullptr &&
+          backend_params_ptr_->qnn_context_ptr_ != nullptr &&
+          backend_params_ptr_->qnn_graph_ptr_ != nullptr,
+      Internal,
+      "QNN source context is not initialized for binary-section extraction");
+
+  const QnnInterface& qnn_interface =
+      backend_bundle_ptr_->implementation->GetQnnInterface();
+  ET_CHECK_OR_RETURN_ERROR(
+      qnn_interface.HasContextGetBinarySectionSize() &&
+          qnn_interface.HasContextGetBinarySection(),
+      Internal,
+      "QNN backend does not expose binary-section extraction functions");
+
+  Qnn_GraphHandle_t graph_handle =
+      backend_params_ptr_->qnn_graph_ptr_->GetHandle(graph_name);
+  ET_CHECK_OR_RETURN_ERROR(
+      graph_handle != nullptr,
+      Internal,
+      "QNN graph %s is unavailable for binary-section extraction",
+      graph_name.c_str());
+
+  Qnn_ContextBinarySize_t section_size = 0;
+  Qnn_ErrorHandle_t error = qnn_interface.qnn_context_get_binary_section_size(
+      backend_params_ptr_->qnn_context_ptr_->GetHandle(),
+      graph_handle,
+      QNN_CONTEXT_SECTION_UPDATABLE_WEIGHTS,
+      &section_size);
+  updatable_weights_lifecycle_trace_.section_size_status =
+      QNN_GET_ERROR_CODE(error);
+  if (error != QNN_SUCCESS) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "QNN updatable-weights section size failed. Error: %d",
+        QNN_GET_ERROR_CODE(error));
+    return Error::Internal;
+  }
+  ET_CHECK_OR_RETURN_ERROR(
+      section_size > 0,
+      Internal,
+      "QNN updatable-weights section has zero bytes");
+
+  section.resize(section_size);
+  QnnContext_Buffer_t buffer{};
+  buffer.version = QNN_CONTEXT_BUFFER_VERSION_1;
+  buffer.v1.memType = QNN_CONTEXTMEMTYPE_RAW;
+  buffer.v1.binaryBuf.data = section.data();
+  buffer.v1.binaryBuf.dataSize = section.size();
+  Qnn_ContextBinarySize_t written_size = 0;
+  error = qnn_interface.qnn_context_get_binary_section(
+      backend_params_ptr_->qnn_context_ptr_->GetHandle(),
+      graph_handle,
+      QNN_CONTEXT_SECTION_UPDATABLE_WEIGHTS,
+      &buffer,
+      &written_size,
+      nullptr,
+      nullptr);
+  updatable_weights_lifecycle_trace_.section_extraction_status =
+      QNN_GET_ERROR_CODE(error);
+  if (error != QNN_SUCCESS) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "QNN updatable-weights section extraction failed. Error: %d",
+        QNN_GET_ERROR_CODE(error));
+    section.clear();
+    return Error::Internal;
+  }
+  ET_CHECK_OR_RETURN_ERROR(
+      written_size > 0 && written_size <= section.size(),
+      Internal,
+      "QNN updatable-weights section wrote invalid byte count %llu of %llu",
+      static_cast<unsigned long long>(written_size),
+      static_cast<unsigned long long>(section.size()));
+  section.resize(written_size);
+  updatable_weights_lifecycle_trace_.section_bytes = section.size();
+  return Error::Ok;
+}
+
+Error QnnManager::UpdateFirstUpdatableStaticTensorAndRefinalize(
+    const std::string& graph_name) {
+  ET_CHECK_OR_RETURN_ERROR(
+      backend_bundle_ptr_ != nullptr &&
+          backend_bundle_ptr_->implementation != nullptr &&
+          backend_params_ptr_ != nullptr &&
+          backend_params_ptr_->qnn_graph_ptr_ != nullptr,
+      Internal,
+      "QNN source graph is not initialized for update/refinalize");
+
+  const QnnInterface& qnn_interface =
+      backend_bundle_ptr_->implementation->GetQnnInterface();
+  updatable_weights_lifecycle_trace_.tensor_update_graph_tensors_available =
+      qnn_interface.HasTensorUpdateGraphTensors();
+  updatable_weights_lifecycle_trace_.graph_finalize_available = true;
+  ET_CHECK_OR_RETURN_ERROR(
+      qnn_interface.HasTensorUpdateGraphTensors(),
+      Internal,
+      "QNN backend does not expose tensorUpdateGraphTensors");
+
+  const auto tensor_it = updateable_static_tensors_.find(graph_name);
+  ET_CHECK_OR_RETURN_ERROR(
+      tensor_it != updateable_static_tensors_.end() && !tensor_it->second.empty(),
+      Internal,
+      "QNN graph %s has no tracked UPDATEABLE_STATIC tensor",
+      graph_name.c_str());
+  const std::shared_ptr<TensorWrapper>& tensor_wrapper = tensor_it->second.front();
+  ET_CHECK_OR_RETURN_ERROR(
+      tensor_wrapper->HasInitialPayload() && tensor_wrapper->GetBytes() > 0,
+      Internal,
+      "UPDATEABLE_STATIC tensor %s has no initialized payload",
+      tensor_wrapper->GetName().c_str());
+
+  Qnn_Tensor_t updated_tensor = tensor_wrapper->CloneTensorStruct();
+  std::vector<uint8_t> updated_payload(tensor_wrapper->GetBytes());
+  std::memcpy(
+      updated_payload.data(),
+      tensor_wrapper->GetStaticTensorData(),
+      updated_payload.size());
+  updated_payload.front() ^= 0x01;
+  QNN_TENSOR_VER_PTR(updated_tensor)->clientBuf.data = updated_payload.data();
+  QNN_TENSOR_VER_PTR(updated_tensor)->clientBuf.dataSize = updated_payload.size();
+
+  updatable_weights_lifecycle_trace_.tensor_name = tensor_wrapper->GetName();
+  updatable_weights_lifecycle_trace_.tensor_id =
+      QNN_TENSOR_VER_PTR(updated_tensor)->id;
+  updatable_weights_lifecycle_trace_.tensor_dims.assign(
+      tensor_wrapper->GetDims(),
+      tensor_wrapper->GetDims() + tensor_wrapper->GetRank());
+  updatable_weights_lifecycle_trace_.payload_bytes = updated_payload.size();
+  uint64_t payload_hash = 1469598103934665603ULL;
+  for (const uint8_t byte : updated_payload) {
+    payload_hash ^= byte;
+    payload_hash *= 1099511628211ULL;
+  }
+  updatable_weights_lifecycle_trace_.payload_fnv1a64 = payload_hash;
+
+  const Qnn_Tensor_t* tensors[] = {&updated_tensor};
+  Qnn_GraphHandle_t graph_handle =
+      backend_params_ptr_->qnn_graph_ptr_->GetHandle(graph_name);
+  ET_CHECK_OR_RETURN_ERROR(
+      graph_handle != nullptr,
+      Internal,
+      "QNN graph %s is unavailable for update/refinalize",
+      graph_name.c_str());
+  Qnn_ErrorHandle_t error = qnn_interface.qnn_tensor_update_graph_tensors(
+      graph_handle, tensors, 1);
+  updatable_weights_lifecycle_trace_.tensor_update_status =
+      QNN_GET_ERROR_CODE(error);
+  if (error != QNN_SUCCESS) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "QNN updateable tensor update failed. Error: %d",
+        QNN_GET_ERROR_CODE(error));
+    return Error::Internal;
+  }
+
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnGraphFinalize, 1);
+  error = backend_params_ptr_->qnn_graph_ptr_->GraphFinalize(graph_name);
+  updatable_weights_lifecycle_trace_.graph_refinalize_status =
+      QNN_GET_ERROR_CODE(error);
+  if (error != QNN_SUCCESS) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "QNN updateable graph re-finalize failed. Error: %d",
+        QNN_GET_ERROR_CODE(error));
+    return Error::Internal;
+  }
+  return Error::Ok;
+}
+
+Error QnnManager::UpdateAllUpdatableStaticTensorsAndRefinalize(
+    const std::string& graph_name) {
+  ET_CHECK_OR_RETURN_ERROR(
+      backend_bundle_ptr_ != nullptr &&
+          backend_bundle_ptr_->implementation != nullptr &&
+          backend_params_ptr_ != nullptr &&
+          backend_params_ptr_->qnn_graph_ptr_ != nullptr,
+      Internal,
+      "QNN source graph is not initialized for batched update/refinalize");
+
+  const QnnInterface& qnn_interface =
+      backend_bundle_ptr_->implementation->GetQnnInterface();
+  updatable_weights_lifecycle_trace_.tensor_update_graph_tensors_available =
+      qnn_interface.HasTensorUpdateGraphTensors();
+  updatable_weights_lifecycle_trace_.graph_finalize_available = true;
+  ET_CHECK_OR_RETURN_ERROR(
+      qnn_interface.HasTensorUpdateGraphTensors(),
+      Internal,
+      "QNN backend does not expose tensorUpdateGraphTensors");
+
+  const auto tensor_it = updateable_static_tensors_.find(graph_name);
+  ET_CHECK_OR_RETURN_ERROR(
+      tensor_it != updateable_static_tensors_.end() &&
+          !tensor_it->second.empty(),
+      Internal,
+      "QNN graph %s has no tracked UPDATEABLE_STATIC tensor",
+      graph_name.c_str());
+
+  std::vector<Qnn_Tensor_t> updated_tensors;
+  std::vector<std::vector<uint8_t>> updated_payloads;
+  std::vector<const Qnn_Tensor_t*> tensor_ptrs;
+  updated_tensors.reserve(tensor_it->second.size());
+  updated_payloads.reserve(tensor_it->second.size());
+  tensor_ptrs.reserve(tensor_it->second.size());
+  updatable_weights_lifecycle_trace_.updated_tensors.clear();
+
+  for (size_t tensor_index = 0; tensor_index < tensor_it->second.size();
+       ++tensor_index) {
+    const std::shared_ptr<TensorWrapper>& tensor_wrapper =
+        tensor_it->second[tensor_index];
+    ET_CHECK_OR_RETURN_ERROR(
+        tensor_wrapper->HasInitialPayload() && tensor_wrapper->GetBytes() > 0,
+        Internal,
+        "UPDATEABLE_STATIC tensor %s has no initialized payload",
+        tensor_wrapper->GetName().c_str());
+
+    updated_tensors.push_back(tensor_wrapper->CloneTensorStruct());
+    updated_payloads.emplace_back(tensor_wrapper->GetBytes());
+    std::vector<uint8_t>& updated_payload = updated_payloads.back();
+    std::memcpy(
+        updated_payload.data(),
+        tensor_wrapper->GetStaticTensorData(),
+        updated_payload.size());
+    updated_payload[tensor_index % updated_payload.size()] ^=
+        static_cast<uint8_t>(tensor_index + 1);
+    QNN_TENSOR_VER_PTR(updated_tensors.back())->clientBuf.data =
+        updated_payload.data();
+    QNN_TENSOR_VER_PTR(updated_tensors.back())->clientBuf.dataSize =
+        updated_payload.size();
+    tensor_ptrs.push_back(&updated_tensors.back());
+
+    UpdatableWeightsLifecycleTrace::TensorUpdateTrace trace;
+    trace.tensor_name = tensor_wrapper->GetName();
+    trace.tensor_id = QNN_TENSOR_VER_PTR(updated_tensors.back())->id;
+    trace.tensor_dims.assign(
+        tensor_wrapper->GetDims(),
+        tensor_wrapper->GetDims() + tensor_wrapper->GetRank());
+    trace.payload_bytes = updated_payload.size();
+    trace.payload_fnv1a64 = 1469598103934665603ULL;
+    for (const uint8_t byte : updated_payload) {
+      trace.payload_fnv1a64 ^= byte;
+      trace.payload_fnv1a64 *= 1099511628211ULL;
+    }
+    updatable_weights_lifecycle_trace_.updated_tensors.push_back(
+        std::move(trace));
+  }
+
+  const auto& first_trace = updatable_weights_lifecycle_trace_.updated_tensors.front();
+  updatable_weights_lifecycle_trace_.tensor_name = first_trace.tensor_name;
+  updatable_weights_lifecycle_trace_.tensor_id = first_trace.tensor_id;
+  updatable_weights_lifecycle_trace_.tensor_dims = first_trace.tensor_dims;
+  updatable_weights_lifecycle_trace_.payload_bytes = first_trace.payload_bytes;
+  updatable_weights_lifecycle_trace_.payload_fnv1a64 =
+      first_trace.payload_fnv1a64;
+
+  Qnn_GraphHandle_t graph_handle =
+      backend_params_ptr_->qnn_graph_ptr_->GetHandle(graph_name);
+  ET_CHECK_OR_RETURN_ERROR(
+      graph_handle != nullptr,
+      Internal,
+      "QNN graph %s is unavailable for batched update/refinalize",
+      graph_name.c_str());
+  Qnn_ErrorHandle_t error = qnn_interface.qnn_tensor_update_graph_tensors(
+      graph_handle, tensor_ptrs.data(), tensor_ptrs.size());
+  updatable_weights_lifecycle_trace_.tensor_update_status =
+      QNN_GET_ERROR_CODE(error);
+  if (error != QNN_SUCCESS) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "QNN batched updateable tensor update failed. Error: %d",
+        QNN_GET_ERROR_CODE(error));
+    return Error::Internal;
+  }
+
+  QnnExecuTorchAotDiagAdd(kAotDiagQnnGraphFinalize, 1);
+  error = backend_params_ptr_->qnn_graph_ptr_->GraphFinalize(graph_name);
+  updatable_weights_lifecycle_trace_.graph_refinalize_status =
+      QNN_GET_ERROR_CODE(error);
+  if (error != QNN_SUCCESS) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "QNN batched updateable graph re-finalize failed. Error: %d",
+        QNN_GET_ERROR_CODE(error));
+    return Error::Internal;
+  }
+  return Error::Ok;
+}
+
 Error QnnManager::CompileDlc() {
   Qnn_ErrorHandle_t error;
   auto qnn_dlc_graph_info = qnn_dlc_manager_->GetQnnDlcGraphInfoPtr();
@@ -686,16 +986,34 @@ Error QnnManager::Compile(
       qnn_dlc_manager_->backend_params_ptr_->qnn_graph_ptr_.get() != nullptr) {
     qnn_graph_ptr = qnn_dlc_manager_->backend_params_ptr_->qnn_graph_ptr_.get();
   }
+  bool has_updateable_static_tensor = false;
   for (std::shared_ptr<OpWrapper>& op_wrapper : op_wrappers) {
     for (const auto& tensor_wrapper : op_wrapper->GetInputTensors()) {
+      has_updateable_static_tensor = has_updateable_static_tensor ||
+          tensor_wrapper->GetTensorType() == QNN_TENSOR_TYPE_UPDATEABLE_STATIC;
       ET_CHECK_OR_RETURN_ERROR(
           qnn_graph_ptr->EnsureTensorInQnnGraph(graph_name, tensor_wrapper) ==
               Error::Ok,
           Internal,
           "Tensor name %s isn't added to Qnn Graph",
           tensor_wrapper->GetName().c_str());
+      if (tensor_wrapper->GetTensorType() ==
+          QNN_TENSOR_TYPE_UPDATEABLE_STATIC) {
+        auto& tracked_tensors = updateable_static_tensors_[graph_name];
+        const auto duplicate = std::find_if(
+            tracked_tensors.begin(),
+            tracked_tensors.end(),
+            [&tensor_wrapper](const std::shared_ptr<TensorWrapper>& tracked) {
+              return tracked->GetName() == tensor_wrapper->GetName();
+            });
+        if (duplicate == tracked_tensors.end()) {
+          tracked_tensors.push_back(tensor_wrapper);
+        }
+      }
     }
     for (const auto& tensor_wrapper : op_wrapper->GetOutputTensors()) {
+      has_updateable_static_tensor = has_updateable_static_tensor ||
+          tensor_wrapper->GetTensorType() == QNN_TENSOR_TYPE_UPDATEABLE_STATIC;
       ET_CHECK_OR_RETURN_ERROR(
           qnn_graph_ptr->EnsureTensorInQnnGraph(graph_name, tensor_wrapper) ==
               Error::Ok,
@@ -706,6 +1024,9 @@ Error QnnManager::Compile(
     for (const auto& param : op_wrapper->GetParams()) {
       auto* p_tensor_param = dynamic_cast<TensorParamWrapper*>(param.get());
       if (p_tensor_param != nullptr) {
+        has_updateable_static_tensor = has_updateable_static_tensor ||
+            p_tensor_param->GetTensorWrapper()->GetTensorType() ==
+            QNN_TENSOR_TYPE_UPDATEABLE_STATIC;
         ET_CHECK_OR_RETURN_ERROR(
             qnn_graph_ptr->EnsureTensorInQnnGraph(
                 graph_name, p_tensor_param->GetTensorWrapper()) == Error::Ok,
@@ -723,6 +1044,21 @@ Error QnnManager::Compile(
     if (error != QNN_SUCCESS) {
       QNN_EXECUTORCH_LOG_ERROR(
           "Failed to add node to Qnn Graph with error: %d",
+          QNN_GET_ERROR_CODE(error));
+      return Error::Internal;
+    }
+  }
+  const bool binary_section_weights_updates_config_enabled =
+      has_updateable_static_tensor &&
+      !ShouldOmitBinarySectionWeightsUpdatesConfigForProbe();
+  updatable_weights_lifecycle_trace_
+      .binary_section_weights_updates_config_enabled =
+      binary_section_weights_updates_config_enabled;
+  if (binary_section_weights_updates_config_enabled) {
+    error = qnn_graph_ptr->EnableBinarySectionWeightUpdates(graph_name);
+    if (error != QNN_SUCCESS) {
+      QNN_EXECUTORCH_LOG_ERROR(
+          "Failed to enable QNN binary-section weight updates. Error: %d",
           QNN_GET_ERROR_CODE(error));
       return Error::Internal;
     }

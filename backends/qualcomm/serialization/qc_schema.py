@@ -257,6 +257,24 @@ class QnnExecuTorchBackendOptions:
 
 
 @unique
+class QnnLoRAPreparationRole(IntEnum):
+    A = 0
+    B = 1
+
+
+@dataclass
+class QnnLoRAPreparationRecord:
+    parameter_fqn: str = ""
+    role: QnnLoRAPreparationRole = QnnLoRAPreparationRole.A
+    group_id: str = ""
+    dimensions: List[int] = field(default_factory=list)
+    dtype: str = ""
+    layout: str = ""
+    scale_folded: bool = False
+    graph_identity: str = ""
+
+
+@unique
 class QnnExecuTorchOpPackageTarget(IntEnum):
     UNKNOWN = 0
     CPU = 1
@@ -303,3 +321,6 @@ class QnnExecuTorchOptions:
         default_factory=QnnExecuTorchOpPackageOptions
     )
     use_mha2sha: bool = False
+    native_lora_preparation_records: List[QnnLoRAPreparationRecord] = field(
+        default_factory=list
+    )

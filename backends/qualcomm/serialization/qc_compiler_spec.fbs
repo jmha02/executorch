@@ -324,6 +324,22 @@ table QnnExecuTorchBackendOptions {
   lpai_options:QnnExecuTorchLpaiBackendOptions;
 }
 
+enum QnnLoRAPreparationRole: byte {
+  A = 0,
+  B = 1,
+}
+
+table QnnLoRAPreparationRecord {
+  parameter_fqn:string;
+  role:QnnLoRAPreparationRole;
+  group_id:string;
+  dimensions:[uint];
+  dtype:string;
+  layout:string;
+  scale_folded:bool;
+  graph_identity:string;
+}
+
 table QnnExecuTorchOptions {
   /// Specify SoC to compile or execute for.
   soc_info:SocInfo;
@@ -364,6 +380,9 @@ table QnnExecuTorchOptions {
 
   /// This experimental parameter is used to decide whether to enable multi-head attention to single-head attention pass, aiming to reduce time consumption in AOT and improve performance on HTP.
   use_mha2sha:bool;
+
+  /// Opt-in typed metadata consumed by native LoRA-preparation experiments.
+  native_lora_preparation_records:[QnnLoRAPreparationRecord];
 }
 
 root_type QnnExecuTorchOptions;

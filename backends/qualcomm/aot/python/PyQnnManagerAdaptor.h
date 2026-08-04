@@ -17,7 +17,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <memory>
+#include <stdexcept>
 #include <string_view>
+#include <vector>
 
 namespace py = pybind11;
 namespace executorch {
@@ -248,29 +250,49 @@ class PyQnnManager {
   py::array_t<char> Compile(
       const std::vector<std::string>& graph_names,
       std::vector<std::vector<std::shared_ptr<OpWrapper>>>& op_wrappers) {
-    QnnExecuTorchContextBinary binary_info;
+    return CompileImpl(graph_names, op_wrappers, nullptr);
+  }
 
-    for (uint32_t i = 0; i < graph_names.size(); ++i) {
-      if (qnn_manager_->Compile(graph_names[i], op_wrappers[i]) !=
-          executorch::runtime::Error::Ok) {
-        QNN_EXECUTORCH_LOG_ERROR("Fail to compile QNN graph");
-        return py::array_t<char>(0);
-      }
-    }
-    auto qnn_executorch_options = GetQnnExecuTorchOptions(
-        qnn_executorch_option_ptr_.cast<std::string_view>().data());
-    if (qnn_executorch_options->saver() ||
-        qnn_manager_->GetContextBinary(binary_info) !=
-            executorch::runtime::Error::Ok) {
-      return py::array_t<char>(0);
-    }
+  py::tuple CompileWithUpdatableWeightsSection(
+      const std::vector<std::string>& graph_names,
+      std::vector<std::vector<std::shared_ptr<OpWrapper>>>& op_wrappers) {
+    std::vector<uint8_t> section;
+    py::array_t<char> context = CompileImpl(graph_names, op_wrappers, &section);
+    return py::make_tuple(
+        context,
+        py::bytes(reinterpret_cast<const char*>(section.data()), section.size()));
+  }
 
-    // allocate py::array (to pass the result of the C++ function to Python)
-    auto result = py::array_t<char>(binary_info.nbytes);
-    auto result_buffer = result.request();
-    char* result_ptr = (char*)result_buffer.ptr;
-    std::memcpy(result_ptr, binary_info.buffer, binary_info.nbytes);
-    return result;
+  py::tuple CompileWithUpdatedUpdatableWeightsSection(
+      const std::vector<std::string>& graph_names,
+      std::vector<std::vector<std::shared_ptr<OpWrapper>>>& op_wrappers) {
+    std::vector<uint8_t> section;
+    std::vector<uint8_t> base_context;
+    py::array_t<char> context =
+        CompileImpl(graph_names, op_wrappers, &section, true, &base_context);
+    return py::make_tuple(
+        context,
+        py::bytes(
+            reinterpret_cast<const char*>(base_context.data()),
+            base_context.size()),
+        py::bytes(reinterpret_cast<const char*>(section.data()), section.size()),
+        GetUpdatableWeightsLifecycleTrace());
+  }
+
+  py::tuple CompileWithAllUpdatedUpdatableWeightsSection(
+      const std::vector<std::string>& graph_names,
+      std::vector<std::vector<std::shared_ptr<OpWrapper>>>& op_wrappers) {
+    std::vector<uint8_t> section;
+    std::vector<uint8_t> base_context;
+    py::array_t<char> context = CompileImpl(
+        graph_names, op_wrappers, &section, true, &base_context, true);
+    return py::make_tuple(
+        context,
+        py::bytes(
+            reinterpret_cast<const char*>(base_context.data()),
+            base_context.size()),
+        py::bytes(reinterpret_cast<const char*>(section.data()), section.size()),
+        GetUpdatableWeightsLifecycleTrace());
   }
 
   void Destroy() {
@@ -339,7 +361,134 @@ class PyQnnManager {
     return result;
   }
 
+  py::bytes GetUpdatableWeightsBinarySection(const std::string& graph_name) {
+    std::vector<uint8_t> section;
+    if (qnn_manager_->GetUpdatableWeightsBinarySection(graph_name, section) !=
+        executorch::runtime::Error::Ok) {
+      throw std::runtime_error(
+          "failed to extract QNN_CONTEXT_SECTION_UPDATABLE_WEIGHTS");
+    }
+    return py::bytes(
+        reinterpret_cast<const char*>(section.data()), section.size());
+  }
+
+  py::dict GetUpdatableWeightsLifecycleTrace() const {
+    const auto& trace = qnn_manager_->GetUpdatableWeightsLifecycleTrace();
+    py::dict result;
+    result["tensor_update_graph_tensors_available"] =
+        trace.tensor_update_graph_tensors_available;
+    result["graph_finalize_available"] = trace.graph_finalize_available;
+    result["binary_section_weights_updates_config_enabled"] =
+        trace.binary_section_weights_updates_config_enabled;
+    result["base_context_serialization_status"] =
+        trace.base_context_serialization_status;
+    result["base_context_bytes"] = trace.base_context_bytes;
+    result["base_context_fnv1a64"] = trace.base_context_fnv1a64;
+    result["tensor_update_status"] = trace.tensor_update_status;
+    result["graph_refinalize_status"] = trace.graph_refinalize_status;
+    result["section_size_status"] = trace.section_size_status;
+    result["section_extraction_status"] = trace.section_extraction_status;
+    result["section_bytes"] = trace.section_bytes;
+    result["tensor_name"] = trace.tensor_name;
+    result["tensor_id"] = trace.tensor_id;
+    result["tensor_dims"] = trace.tensor_dims;
+    result["payload_bytes"] = trace.payload_bytes;
+    result["payload_fnv1a64"] = trace.payload_fnv1a64;
+    py::list updated_tensors;
+    for (const auto& tensor : trace.updated_tensors) {
+      py::dict tensor_result;
+      tensor_result["tensor_name"] = tensor.tensor_name;
+      tensor_result["tensor_id"] = tensor.tensor_id;
+      tensor_result["tensor_dims"] = tensor.tensor_dims;
+      tensor_result["payload_bytes"] = tensor.payload_bytes;
+      tensor_result["payload_fnv1a64"] = tensor.payload_fnv1a64;
+      updated_tensors.append(tensor_result);
+    }
+    result["updated_tensors"] = updated_tensors;
+    return result;
+  }
+
  private:
+  py::array_t<char> CompileImpl(
+      const std::vector<std::string>& graph_names,
+      std::vector<std::vector<std::shared_ptr<OpWrapper>>>& op_wrappers,
+      std::vector<uint8_t>* section,
+      bool update_and_refinalize = false,
+      std::vector<uint8_t>* base_context = nullptr,
+      bool update_all = false) {
+    QnnExecuTorchContextBinary binary_info;
+    qnn_manager_->ResetUpdatableWeightsLifecycleTrace();
+
+    for (uint32_t i = 0; i < graph_names.size(); ++i) {
+      if (qnn_manager_->Compile(graph_names[i], op_wrappers[i]) !=
+          executorch::runtime::Error::Ok) {
+        QNN_EXECUTORCH_LOG_ERROR("Fail to compile QNN graph");
+        return py::array_t<char>(0);
+      }
+    }
+    if (update_and_refinalize) {
+      QnnExecuTorchContextBinary base_binary;
+      const executorch::runtime::Error base_status =
+          qnn_manager_->GetContextBinary(base_binary);
+      const uint64_t base_context_bytes =
+          base_status == executorch::runtime::Error::Ok ? base_binary.nbytes : 0;
+      uint64_t base_context_fnv1a64 = 1469598103934665603ULL;
+      if (base_status == executorch::runtime::Error::Ok) {
+        const auto* base_data = reinterpret_cast<const uint8_t*>(base_binary.buffer);
+        for (uint64_t index = 0; index < base_binary.nbytes; ++index) {
+          base_context_fnv1a64 ^= base_data[index];
+          base_context_fnv1a64 *= 1099511628211ULL;
+        }
+      }
+      qnn_manager_->RecordBaseContextSerialization(
+          base_status, base_context_bytes, base_context_fnv1a64);
+      if (base_status != executorch::runtime::Error::Ok) {
+        return py::array_t<char>(0);
+      }
+      if (base_context != nullptr) {
+        base_context->assign(
+            reinterpret_cast<const uint8_t*>(base_binary.buffer),
+            reinterpret_cast<const uint8_t*>(base_binary.buffer) +
+                base_binary.nbytes);
+      }
+      if (graph_names.empty()) {
+        return py::array_t<char>(0);
+      }
+      const executorch::runtime::Error update_status = update_all
+          ? qnn_manager_->UpdateAllUpdatableStaticTensorsAndRefinalize(
+                graph_names.front())
+          : qnn_manager_->UpdateFirstUpdatableStaticTensorAndRefinalize(
+                graph_names.front());
+      if (update_status != executorch::runtime::Error::Ok) {
+        return py::array_t<char>(0);
+      }
+    }
+    if (section != nullptr) {
+      if (graph_names.empty() ||
+          qnn_manager_->GetUpdatableWeightsBinarySection(
+              graph_names.front(), *section) != executorch::runtime::Error::Ok) {
+        if (update_and_refinalize) {
+          return py::array_t<char>(0);
+        }
+        throw std::runtime_error(
+            "failed to extract QNN_CONTEXT_SECTION_UPDATABLE_WEIGHTS");
+      }
+    }
+    auto qnn_executorch_options = GetQnnExecuTorchOptions(
+        qnn_executorch_option_ptr_.cast<std::string_view>().data());
+    if (qnn_executorch_options->saver() ||
+        qnn_manager_->GetContextBinary(binary_info) !=
+            executorch::runtime::Error::Ok) {
+      return py::array_t<char>(0);
+    }
+
+    // allocate py::array (to pass the result of the C++ function to Python)
+    auto result = py::array_t<char>(binary_info.nbytes);
+    auto result_buffer = result.request();
+    char* result_ptr = (char*)result_buffer.ptr;
+    std::memcpy(result_ptr, binary_info.buffer, binary_info.nbytes);
+    return result;
+  }
   // Store the bytes object instead of a raw pointer so that this module will
   // keep the bytes alive.
   const py::bytes qnn_executorch_option_ptr_;

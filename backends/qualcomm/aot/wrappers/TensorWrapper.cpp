@@ -103,10 +103,16 @@ TensorWrapper::TensorWrapper(
   QNN_TENSOR_VER_PTR(tensor_)->rank = rank;
   QNN_TENSOR_VER_PTR(tensor_)->memType = QNN_TENSORMEMTYPE_RAW;
 
+  ET_CHECK_MSG(
+      tensor_type != QNN_TENSOR_TYPE_UPDATEABLE_STATIC || data != nullptr,
+      "UPDATEABLE_STATIC tensor %s requires initialized payload bytes",
+      tensor_name.c_str());
+
   if (data != nullptr) {
     QNN_TENSOR_VER_PTR(tensor_)->clientBuf.dataSize = bytes;
 
-    if (tensor_type != QNN_TENSOR_TYPE_STATIC) {
+    if (tensor_type != QNN_TENSOR_TYPE_STATIC &&
+        tensor_type != QNN_TENSOR_TYPE_UPDATEABLE_STATIC) {
       QNN_TENSOR_VER_PTR(tensor_)->clientBuf.data = nullptr;
     } else if (copy_data) {
       owned_data_ = std::make_unique<char[]>(bytes);

@@ -65,6 +65,10 @@ class TensorWrapper {
     return QNN_TENSOR_VER_PTR(tensor_)->type == QNN_TENSOR_TYPE_STATIC;
   };
 
+  Qnn_TensorType_t GetTensorType() const {
+    return QNN_TENSOR_VER_PTR(tensor_)->type;
+  }
+
   std::uint32_t* GetDims() const {
     return QNN_TENSOR_VER_PTR(tensor_)->dimensions;
   };
@@ -113,6 +117,14 @@ class TensorWrapper {
   const void* GetStaticTensorData() const {
     return QNN_TENSOR_VER_PTR(tensor_)->clientBuf.data;
   };
+
+  bool HasInitialPayload() const {
+    return QNN_TENSOR_VER_PTR(tensor_)->clientBuf.data != nullptr;
+  }
+
+  std::uint32_t GetInitialPayloadSize() const {
+    return QNN_TENSOR_VER_PTR(tensor_)->clientBuf.dataSize;
+  }
 
   executorch::runtime::Error SetName(const std::string& name);
 

@@ -19,12 +19,40 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 namespace executorch {
 namespace backends {
 namespace qnn {
 class QnnManager {
  public:
+  struct UpdatableWeightsLifecycleTrace {
+    struct TensorUpdateTrace {
+      std::string tensor_name;
+      uint32_t tensor_id{0};
+      std::vector<uint32_t> tensor_dims;
+      uint32_t payload_bytes{0};
+      uint64_t payload_fnv1a64{0};
+    };
+
+    bool tensor_update_graph_tensors_available{false};
+    bool graph_finalize_available{false};
+    bool binary_section_weights_updates_config_enabled{false};
+    uint32_t base_context_serialization_status{QNN_ERROR_UNDEFINED};
+    uint64_t base_context_bytes{0};
+    uint64_t base_context_fnv1a64{0};
+    uint32_t tensor_update_status{QNN_ERROR_UNDEFINED};
+    uint32_t graph_refinalize_status{QNN_ERROR_UNDEFINED};
+    uint32_t section_size_status{QNN_ERROR_UNDEFINED};
+    uint32_t section_extraction_status{QNN_ERROR_UNDEFINED};
+    uint64_t section_bytes{0};
+    std::string tensor_name;
+    uint32_t tensor_id{0};
+    std::vector<uint32_t> tensor_dims;
+    uint32_t payload_bytes{0};
+    uint64_t payload_fnv1a64{0};
+    std::vector<TensorUpdateTrace> updated_tensors;
+  };
   // Construct QnnManager
   explicit QnnManager(
       const QnnExecuTorchOptions* options,
@@ -81,6 +109,35 @@ class QnnManager {
   executorch::runtime::Error GetContextBinary(
       QnnExecuTorchContextBinary& qnn_executorch_context_binary);
 
+  executorch::runtime::Error GetUpdatableWeightsBinarySection(
+      const std::string& graph_name,
+      std::vector<uint8_t>& section);
+
+  executorch::runtime::Error UpdateFirstUpdatableStaticTensorAndRefinalize(
+      const std::string& graph_name);
+
+  executorch::runtime::Error UpdateAllUpdatableStaticTensorsAndRefinalize(
+      const std::string& graph_name);
+
+  void ResetUpdatableWeightsLifecycleTrace() {
+    updatable_weights_lifecycle_trace_ = {};
+  }
+
+  void RecordBaseContextSerialization(
+      executorch::runtime::Error status,
+      uint64_t bytes,
+      uint64_t fnv1a64 = 0) {
+    updatable_weights_lifecycle_trace_.base_context_serialization_status =
+        static_cast<uint32_t>(status);
+    updatable_weights_lifecycle_trace_.base_context_bytes = bytes;
+    updatable_weights_lifecycle_trace_.base_context_fnv1a64 = fnv1a64;
+  }
+
+  const UpdatableWeightsLifecycleTrace& GetUpdatableWeightsLifecycleTrace()
+      const {
+    return updatable_weights_lifecycle_trace_;
+  }
+
   executorch::runtime::Error CompileDlc();
   executorch::runtime::Error Compile(
       const std::string& graph_name,
@@ -127,6 +184,9 @@ class QnnManager {
       input_tensors_;
   std::unordered_map<std::string, std::vector<std::shared_ptr<TensorWrapper>>>
       output_tensors_;
+  std::unordered_map<std::string, std::vector<std::shared_ptr<TensorWrapper>>>
+      updateable_static_tensors_;
+  UpdatableWeightsLifecycleTrace updatable_weights_lifecycle_trace_;
   executorch::runtime::Error RegisterIonMem(
       void* data_ptr,
       const std::shared_ptr<TensorWrapper>& tensor_wrapper);

@@ -11,6 +11,9 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+#include <stdexcept>
+
 #include "QnnSdkBuildId.h"
 
 namespace py = pybind11;
@@ -147,6 +150,11 @@ std::shared_ptr<TensorWrapper> CreateTensorWrapper(
     const std::vector<uint8_t>& dynamic_dims,
     py::array& data,
     bool copy_data) {
+  if (tensor_type == QNN_TENSOR_TYPE_UPDATEABLE_STATIC && data.size() == 0) {
+    throw std::invalid_argument(
+        "UPDATEABLE_STATIC tensor requires initialized payload bytes");
+  }
+
   std::unique_ptr<QuantizeParamsWrapper> quantize_param_wrapper =
       CreateQuantizationParamWrapper(encoding, quant_info);
 
@@ -185,6 +193,45 @@ std::string GetQnnSdkBuildId(std::string library_path) {
   return build_id;
 }
 
+py::dict GetQnnUpdateableAdapterCapabilities(std::string library_path) {
+  QnnImplementation qnn_loaded_backend = QnnImplementation(library_path);
+  ET_CHECK_MSG(
+      qnn_loaded_backend.Load(nullptr) == Error::Ok,
+      "Fail to load Qnn library");
+  const QnnInterface& qnn_interface = qnn_loaded_backend.GetQnnInterface();
+  py::dict function_pointers;
+  function_pointers["property_has_capability"] =
+      qnn_interface.HasPropertyHasCapability();
+  function_pointers["graph_set_config"] = qnn_interface.HasGraphSetConfig();
+  function_pointers["context_get_binary_section_size"] =
+      qnn_interface.HasContextGetBinarySectionSize();
+  function_pointers["context_get_binary_section"] =
+      qnn_interface.HasContextGetBinarySection();
+  function_pointers["tensor_update_graph_tensors"] =
+      qnn_interface.HasTensorUpdateGraphTensors();
+
+  py::dict properties;
+  if (qnn_interface.HasPropertyHasCapability()) {
+    properties["tensor_updateable_static"] =
+        qnn_interface.qnn_property_has_capability(
+            QNN_PROPERTY_TENSOR_SUPPORT_UPDATEABLE_STATIC_TENSORS);
+    properties["graph_updatable_weights_binary_section_creation"] =
+        qnn_interface.qnn_property_has_capability(
+            QNN_PROPERTY_GRAPH_SUPPORT_UPDATABLE_WEIGHTS_BINARY_SECTION_CREATION);
+    properties["context_binary_updates"] =
+        qnn_interface.qnn_property_has_capability(
+            QNN_PROPERTY_CONTEXT_SUPPORT_BINARY_UPDATES);
+    properties["context_binary_weight_only_updates"] =
+        qnn_interface.qnn_property_has_capability(
+            QNN_PROPERTY_CONTEXT_SUPPORT_BINARY_WEIGHT_ONLY_UPDATES);
+  }
+  py::dict result;
+  result["function_pointers"] = function_pointers;
+  result["properties"] = properties;
+  qnn_loaded_backend.Unload();
+  return result;
+}
+
 py::array_t<char> StripProtocol(const py::bytes& preprocessed_binary) {
   py::buffer_info info(py::buffer(preprocessed_binary).request());
 
@@ -216,6 +263,9 @@ PYBIND11_MODULE(PyQnnManagerAdaptor, m) {
 
   m.def("GetQNNCtxBinAlignment", &GetQNNCtxBinAlignment);
   m.def("GetQnnSdkBuildId", &GetQnnSdkBuildId);
+  m.def(
+      "GetQnnUpdateableAdapterCapabilities",
+      &GetQnnUpdateableAdapterCapabilities);
   m.def("StripProtocol", &StripProtocol);
   py::class_<QnnExecuTorchContextBinary>(m, "QnnExecuTorchContextBinary")
       .def(py::init<>());
@@ -239,6 +289,15 @@ PYBIND11_MODULE(PyQnnManagerAdaptor, m) {
               const std::vector<std::string>&,
               std::vector<std::vector<std::shared_ptr<OpWrapper>>>&>(
               &PyQnnManager::Compile))
+      .def(
+          "CompileWithUpdatableWeightsSection",
+          &PyQnnManager::CompileWithUpdatableWeightsSection)
+      .def(
+          "CompileWithUpdatedUpdatableWeightsSection",
+          &PyQnnManager::CompileWithUpdatedUpdatableWeightsSection)
+      .def(
+          "CompileWithAllUpdatedUpdatableWeightsSection",
+          &PyQnnManager::CompileWithAllUpdatedUpdatableWeightsSection)
       .def("Destroy", &PyQnnManager::Destroy)
       .def("DestroyContext", &PyQnnManager::DestroyContext)
       .def("IsAvailable", &PyQnnManager::IsAvailable)
@@ -248,6 +307,12 @@ PYBIND11_MODULE(PyQnnManagerAdaptor, m) {
       .def("GetGraphOutputs", &PyQnnManager::GetGraphOutputs)
       .def("GetGraphNames", &PyQnnManager::GetGraphNames)
       .def("GetSpillFillBufferSize", &PyQnnManager::GetSpillFillBufferSize)
+      .def(
+          "GetUpdatableWeightsBinarySection",
+          &PyQnnManager::GetUpdatableWeightsBinarySection)
+      .def(
+          "GetUpdatableWeightsLifecycleTrace",
+          &PyQnnManager::GetUpdatableWeightsLifecycleTrace)
       .def(
           "MakeBinaryInfo",
           py::overload_cast<const py::bytes&>(&PyQnnManager::MakeBinaryInfo));
@@ -264,6 +329,9 @@ PYBIND11_MODULE(PyQnnManagerAdaptor, m) {
           Qnn_TensorType_t::QNN_TENSOR_TYPE_APP_READWRITE)
       .value("QNN_TENSOR_TYPE_NATIVE", Qnn_TensorType_t::QNN_TENSOR_TYPE_NATIVE)
       .value("QNN_TENSOR_TYPE_STATIC", Qnn_TensorType_t::QNN_TENSOR_TYPE_STATIC)
+      .value(
+          "QNN_TENSOR_TYPE_UPDATEABLE_STATIC",
+          Qnn_TensorType_t::QNN_TENSOR_TYPE_UPDATEABLE_STATIC)
       .value("QNN_TENSOR_TYPE_NULL", Qnn_TensorType_t::QNN_TENSOR_TYPE_NULL)
       .value(
           "QNN_TENSOR_TYPE_UNDEFINED",
@@ -413,7 +481,9 @@ PYBIND11_MODULE(PyQnnManagerAdaptor, m) {
                     const std::vector<uint32_t>&,
                     const std::vector<uint8_t>&,
                     py::array&,
-                    bool>(&CreateTensorWrapper)));
+                    bool>(&CreateTensorWrapper)))
+      .def("HasInitialPayload", &TensorWrapper::HasInitialPayload)
+      .def("GetInitialPayloadSize", &TensorWrapper::GetInitialPayloadSize);
 
   py::class_<QuantizeParamsWrapper>(m, "QuantizeParamsWrapper");
 

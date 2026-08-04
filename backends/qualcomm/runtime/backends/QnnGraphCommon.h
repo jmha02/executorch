@@ -66,6 +66,9 @@ class QnnGraph {
     return handle_[graph_name];
   }
 
+  Qnn_ErrorHandle_t EnableBinarySectionWeightUpdates(
+      const std::string& graph_name);
+
   void SetGraphHandle(
       const std::string& graph_name,
       Qnn_GraphHandle_t graph_handle) {

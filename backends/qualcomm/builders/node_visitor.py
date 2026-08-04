@@ -360,6 +360,10 @@ class NodeVisitor:
                 return PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_APP_READ
 
         if is_parameter(node, self.edge_program):
+            if node.meta.get("qnn_updateable_parameter", False):
+                return (
+                    PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_UPDATEABLE_STATIC
+                )
             return PyQnnManager.Qnn_TensorType_t.QNN_TENSOR_TYPE_STATIC
         # dump all tensor, set to app read, and we only dump native tensors
         if (

@@ -9,7 +9,8 @@ import re
 import warnings
 from collections import defaultdict, OrderedDict
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import executorch.backends.qualcomm.python.PyQnnManagerAdaptor as PyQnnManagerAdaptor
 
@@ -46,6 +47,8 @@ from executorch.backends.qualcomm.serialization.qc_schema import (
     QnnExecuTorchLpaiClientPerf,
     QnnExecuTorchLpaiCoreAffinity,
     QnnExecuTorchLpaiTargetEnv,
+    QnnLoRAPreparationRecord,
+    QnnLoRAPreparationRole,
     QnnExecuTorchOpPackageOptions,
     QnnExecuTorchOptions,
     QnnExecuTorchProfileLevel,
@@ -73,6 +76,66 @@ from torch.export.exported_program import ExportedProgram
 from torch.fx import passes
 from torch.fx.passes.operator_support import OperatorSupportBase
 from torch.library import Library
+
+
+@dataclass(frozen=True)
+class NativeLoRAPreparationError(Exception):
+    detail: str
+
+    def __str__(self) -> str:
+        return self.detail
+
+
+def build_native_lora_preparation_records(
+    module: torch.nn.Module,
+    selected_parameter_names: Sequence[str],
+    *,
+    graph_identity: str,
+    scale_folded: bool,
+) -> List[QnnLoRAPreparationRecord]:
+    if not graph_identity:
+        raise NativeLoRAPreparationError("native LoRA graph identity must be non-empty")
+    selected = tuple(selected_parameter_names)
+    if not selected:
+        return []
+    named_parameters = dict(module.named_parameters())
+    groups: Dict[str, Dict[QnnLoRAPreparationRole, QnnLoRAPreparationRecord]] = {}
+    for parameter_name in selected:
+        match = re.fullmatch(r"(.+)\.lora_([AB])", parameter_name)
+        if match is None or parameter_name not in named_parameters:
+            raise NativeLoRAPreparationError(
+                "native preparation supports only recognized LoRA A/B parameters: "
+                f"{parameter_name}"
+            )
+        group_id, role_name = match.groups()
+        role = QnnLoRAPreparationRole[role_name]
+        parameter = named_parameters[parameter_name]
+        if not parameter.is_contiguous():
+            raise NativeLoRAPreparationError(
+                f"native LoRA parameter must use row-major layout: {parameter_name}"
+            )
+        group = groups.setdefault(group_id, {})
+        if role in group:
+            raise NativeLoRAPreparationError(
+                f"duplicate LoRA role {role.name} in group {group_id}"
+            )
+        group[role] = QnnLoRAPreparationRecord(
+            parameter_fqn=parameter_name,
+            role=role,
+            group_id=group_id,
+            dimensions=list(parameter.shape),
+            dtype=str(parameter.dtype).removeprefix("torch."),
+            layout="row_major",
+            scale_folded=scale_folded,
+            graph_identity=graph_identity,
+        )
+    records: List[QnnLoRAPreparationRecord] = []
+    required_roles = {QnnLoRAPreparationRole.A, QnnLoRAPreparationRole.B}
+    for group_id, group in groups.items():
+        if set(group) != required_roles:
+            raise NativeLoRAPreparationError(f"incomplete LoRA group {group_id}")
+        records.extend(group[role] for role in QnnLoRAPreparationRole)
+    return records
 
 
 class _AnnotationSkipper(OperatorSupportBase):
@@ -342,6 +405,11 @@ def to_edge_transform_and_lower_to_qnn(
     generate_etrecord: Optional[bool] = False,
     convert_linear_to_conv2d: Optional[bool] = False,
     mutable_parameter_names: Optional[Union[List[str], Dict[str, List[str]]]] = None,
+    updateable_parameter_names: Optional[Union[List[str], Dict[str, List[str]]]] = None,
+    native_lora_preparation_parameter_names: Optional[
+        Union[List[str], Dict[str, List[str]]]
+    ] = None,
+    native_lora_preparation_scale_folded: bool = False,
 ) -> EdgeProgramManager:
     """
     Transforms and lowers a given PyTorch module to the QNN backend.
@@ -373,6 +441,14 @@ def to_edge_transform_and_lower_to_qnn(
         mutable_parameter_names (Optional[Union[List[str], Dict[str, List[str]]]]):
             Parameter FQNs to keep as top-level mutable values while passing them
             to QNN as runtime delegate inputs.
+        updateable_parameter_names (Optional[Union[List[str], Dict[str, List[str]]]]):
+            Parameter FQNs to keep delegated while marking them for
+            updateable-static tensor construction.
+        native_lora_preparation_parameter_names (Optional[Union[List[str], Dict[str, List[str]]]]):
+            Standard LoRA A/B parameter FQNs to serialize as an opt-in native
+            preparation contract. When selected, this isolated mode promotes
+            only the typed pair to updateable-static construction; when absent,
+            mutable_parameter_names retains the existing APP_WRITE behavior.
 
     Returns:
         EdgeProgramManager:
@@ -417,6 +493,44 @@ def to_edge_transform_and_lower_to_qnn(
     mutable_parameter_names = ensure_graph_specific_dict(
         mutable_parameter_names, graph_names
     )
+    updateable_parameter_names = ensure_graph_specific_dict(
+        updateable_parameter_names, graph_names
+    )
+    native_lora_preparation_parameter_names = ensure_graph_specific_dict(
+        native_lora_preparation_parameter_names, graph_names
+    )
+
+    for graph_name, graph_module in module.items():
+        selected = native_lora_preparation_parameter_names[graph_name]
+        if selected is None:
+            continue
+        if updateable_parameter_names[graph_name]:
+            raise NativeLoRAPreparationError(
+                "native LoRA preparation cannot combine with explicit updateable parameters"
+            )
+        selected_set = set(selected)
+        conflicting_names = selected_set & (
+            set(mutable_parameter_names[graph_name] or [])
+        )
+        if conflicting_names:
+            raise NativeLoRAPreparationError(
+                "native LoRA preparation overlaps mutable parameters: "
+                f"{sorted(conflicting_names)}"
+            )
+        records = build_native_lora_preparation_records(
+            graph_module,
+            selected,
+            graph_identity=graph_name,
+            scale_folded=native_lora_preparation_scale_folded,
+        )
+        updateable_parameter_names[graph_name] = list(selected)
+        option = generate_qnn_executorch_option(compiler_specs[graph_name])
+        python_options = flatbuffer_to_option(option)
+        python_options.native_lora_preparation_records = records
+        for compile_spec in compiler_specs[graph_name]:
+            if compile_spec.key == QCOM_QNN_COMPILE_SPEC:
+                compile_spec.value = option_to_flatbuffer(python_options)
+                break
 
     # Prepare programs and partitioners
     aten_programs = {}
@@ -429,6 +543,7 @@ def to_edge_transform_and_lower_to_qnn(
                 skip_node_op_set=skip_node_op_set,
                 skip_mutable_buffer=skip_mutable_buffer,
                 mutable_parameter_names=mutable_parameter_names[graph_name],
+                updateable_parameter_names=updateable_parameter_names[graph_name],
             )
         ]
         for graph_name in graph_names

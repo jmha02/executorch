@@ -105,6 +105,39 @@ Qnn_ErrorHandle_t QnnGraph::GraphExecute(
       /*signalHandle=*/nullptr);
 };
 
+Qnn_ErrorHandle_t QnnGraph::EnableBinarySectionWeightUpdates(
+    const std::string& graph_name) {
+  if (!handle_.count(graph_name)) {
+    QNN_EXECUTORCH_LOG_ERROR(
+        "graph name: %s does not exist.", graph_name.c_str());
+    return QNN_COMMON_ERROR_INVALID_ARGUMENT;
+  }
+
+  const QnnInterface& qnn_interface = implementation_->GetQnnInterface();
+  if (!qnn_interface.HasPropertyHasCapability() ||
+      !qnn_interface.HasGraphSetConfig()) {
+    return QNN_COMMON_ERROR_NOT_SUPPORTED;
+  }
+  const Qnn_ErrorHandle_t tensor_capability =
+      qnn_interface.qnn_property_has_capability(
+          QNN_PROPERTY_TENSOR_SUPPORT_UPDATEABLE_STATIC_TENSORS);
+  if (tensor_capability != QNN_SUCCESS) {
+    return tensor_capability;
+  }
+  const Qnn_ErrorHandle_t graph_capability =
+      qnn_interface.qnn_property_has_capability(
+          QNN_PROPERTY_GRAPH_SUPPORT_UPDATABLE_WEIGHTS_BINARY_SECTION_CREATION);
+  if (graph_capability != QNN_SUCCESS) {
+    return graph_capability;
+  }
+
+  QnnGraph_Config_t config = QNN_GRAPH_CONFIG_INIT;
+  config.option = QNN_GRAPH_CONFIG_OPTION_ENABLE_BINARY_SECTION_WEIGHTS_UPDATES;
+  config.enableBinarySectionWeightsUpdates = 1;
+  const QnnGraph_Config_t* configs[] = {&config, nullptr};
+  return qnn_interface.qnn_graph_set_config(handle_[graph_name], configs);
+}
+
 Error QnnGraph::EnsureTensorInQnnGraph(
     const std::string& graph_name,
     const std::shared_ptr<TensorWrapper>& tensor_wrapper) {
