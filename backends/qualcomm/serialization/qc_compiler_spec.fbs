@@ -203,6 +203,31 @@ table QnnExecuTorchHtpBackendOptions {
   /// It will help the by reducing overall bandwith on the use case.
   /// The feature is only supported by specific SOCs.
   use_slc_allocator:bool;
+
+  /// HTP graph options below are passed to QNN only when not -1.
+  /// Graph optimization level (O); ExecuTorch uses 3 offline, 1 online otherwise.
+  optimization_level:int = -1;
+
+  /// FINALIZE_CONFIG "P" point (takes effect at O=3 only).
+  finalize_p:int = -1;
+
+  /// Number of HVX threads the graph uses.
+  num_hvx_threads:int = -1;
+
+  /// Graph VTCM size in MB (0 = maximum); the SoC's VTCM size otherwise.
+  vtcm_size_in_mb:int = -1;
+
+  /// 0 or 1: fuse advanced activations into the preceding op.
+  advanced_activation_fusion:int = -1;
+
+  /// 0 or 1: FP16 high-precision sigmoid.
+  high_precision_sigmoid:int = -1;
+
+  /// 0 or 1: weights packing.
+  weights_packing:int = -1;
+
+  /// 0 or 1: DLBC compression of weights.
+  dlbc_weights:int = -1;
 }
 
 /// Real-time: Indicates that the model is intended for real-time use cases, where a specific performance threshold must be met.

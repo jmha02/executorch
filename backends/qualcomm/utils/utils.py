@@ -1065,9 +1065,20 @@ def generate_htp_compiler_spec(
     use_weight_sharing: bool = False,
     use_slc_allocator: bool = False,
     htp_performance_mode: QnnExecuTorchHtpPerformanceMode = QnnExecuTorchHtpPerformanceMode.kHtpBurst,
+    optimization_level: int = -1,
+    finalize_p: int = -1,
+    num_hvx_threads: int = -1,
+    vtcm_size_in_mb: int = -1,
+    advanced_activation_fusion: int = -1,
+    high_precision_sigmoid: int = -1,
+    weights_packing: int = -1,
+    dlbc_weights: int = -1,
 ) -> QnnExecuTorchBackendOptions:
     """
     Helper function generating backend options for QNN HTP
+
+    The HTP graph options from optimization_level on are passed to QNN only
+    when not -1 (see qc_compiler_spec.fbs); the boolean ones take 0 or 1.
 
     Args:
         use_fp16: If true, the model is compiled to QNN HTP fp16 runtime.
@@ -1101,6 +1112,14 @@ def generate_htp_compiler_spec(
     htp_options.use_weight_sharing = use_weight_sharing
     htp_options.use_dlbc = use_dlbc
     htp_options.use_slc_allocator = use_slc_allocator
+    htp_options.optimization_level = optimization_level
+    htp_options.finalize_p = finalize_p
+    htp_options.num_hvx_threads = num_hvx_threads
+    htp_options.vtcm_size_in_mb = vtcm_size_in_mb
+    htp_options.advanced_activation_fusion = advanced_activation_fusion
+    htp_options.high_precision_sigmoid = high_precision_sigmoid
+    htp_options.weights_packing = weights_packing
+    htp_options.dlbc_weights = dlbc_weights
     return QnnExecuTorchBackendOptions(
         backend_type=QnnExecuTorchBackendType.kHtpBackend,
         htp_options=htp_options,

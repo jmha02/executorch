@@ -197,6 +197,15 @@ class QnnExecuTorchHtpBackendOptions:
     use_multi_contexts: bool = False
     use_weight_sharing: bool = False
     use_slc_allocator: bool = False
+    # HTP graph options, passed to QNN only when not -1 (see qc_compiler_spec.fbs).
+    optimization_level: int = -1
+    finalize_p: int = -1
+    num_hvx_threads: int = -1
+    vtcm_size_in_mb: int = -1
+    advanced_activation_fusion: int = -1
+    high_precision_sigmoid: int = -1
+    weights_packing: int = -1
+    dlbc_weights: int = -1
 
 
 @unique
